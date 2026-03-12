@@ -49,9 +49,14 @@ class TestJsonCache:
         assert cache.read_if_fresh() == {"a": 1}
 
     def test_read_if_fresh_when_stale(self, tmp_path):
-        cache = JsonCache(tmp_path / "cache.json", ttl_hours=0.0)
+        cache = JsonCache(tmp_path / "cache.json", ttl_hours=1.0)
         cache.write({"a": 1})
-        assert cache.read_if_fresh() is None
+        # Simulate a far-future call to time.time() so age >> ttl_seconds.
+        # Patching avoids Windows filesystem clock-skew flakiness (mtime precision
+        # can make age appear slightly negative when ttl_seconds=0).
+        with patch("paperbot.storage.time") as mock_time:
+            mock_time.time.return_value = 1e12  # far future → huge positive age
+            assert cache.read_if_fresh() is None
 
     def test_write_creates_parent_dirs(self, tmp_path):
         nested = tmp_path / "a" / "b" / "cache.json"
@@ -103,21 +108,67 @@ class TestProbeState:
         assert state.miss_counts == {}
         assert state.last_poll == 0.0
 
-    def test_mark_discovered(self, tmp_path):
+    def test_mark_discovered_stores_dict(self, tmp_path):
         state = ProbeState(tmp_path / "state.json")
         url = "https://isocpp.org/files/papers/D2300R11.pdf"
         assert not state.is_discovered(url)
         state.mark_discovered(url)
         assert state.is_discovered(url)
+        entry = state.discovered[url]
+        assert isinstance(entry, dict)
+        assert "discovered_at" in entry
+        assert entry["last_modified"] is None
+
+    def test_mark_discovered_stores_last_modified(self, tmp_path):
+        state = ProbeState(tmp_path / "state.json")
+        url = "https://isocpp.org/files/papers/D2300R11.pdf"
+        lm_ts = 1_700_000_000.0
+        state.mark_discovered(url, last_modified_ts=lm_ts)
+        entry = state.discovered[url]
+        assert entry["last_modified"] == lm_ts
+        assert entry["discovered_at"] > 0
 
     def test_mark_discovered_is_idempotent(self, tmp_path):
         state = ProbeState(tmp_path / "state.json")
         url = "https://isocpp.org/files/papers/D2300R11.pdf"
-        state.mark_discovered(url)
-        first_ts = state.discovered[url]
+        state.mark_discovered(url, last_modified_ts=111.0)
+        first_entry = dict(state.discovered[url])
         time.sleep(0.01)
-        state.mark_discovered(url)
-        assert state.discovered[url] == first_ts
+        state.mark_discovered(url, last_modified_ts=999.0)  # second call ignored
+        assert state.discovered[url] == first_entry
+
+    def test_discovered_info_returns_entry(self, tmp_path):
+        state = ProbeState(tmp_path / "state.json")
+        url = "https://isocpp.org/files/papers/D2300R11.pdf"
+        state.mark_discovered(url, last_modified_ts=42.0)
+        info = state.discovered_info(url)
+        assert info is not None
+        assert info["last_modified"] == 42.0
+
+    def test_discovered_info_returns_none_for_unknown(self, tmp_path):
+        state = ProbeState(tmp_path / "state.json")
+        assert state.discovered_info("https://example.com/nope.pdf") is None
+
+    def test_migration_converts_old_float_entries(self, tmp_path):
+        """Existing float entries in discovered are migrated to the dict schema."""
+        path = tmp_path / "state.json"
+        old_data = {
+            "discovered": {
+                "https://isocpp.org/files/papers/D0085R4.html": 1_773_180_357.0,
+                "https://isocpp.org/files/papers/D2300R11.pdf": 1_700_000_000.0,
+            },
+            "miss_counts": {},
+            "last_poll": 0.0,
+        }
+        path.write_text(json.dumps(old_data), encoding="utf-8")
+        state = ProbeState(path)
+
+        url = "https://isocpp.org/files/papers/D0085R4.html"
+        assert state.is_discovered(url)
+        entry = state.discovered[url]
+        assert isinstance(entry, dict)
+        assert entry["discovered_at"] == 1_773_180_357.0
+        assert entry["last_modified"] is None
 
     def test_miss_counter_increments(self, tmp_path):
         state = ProbeState(tmp_path / "state.json")

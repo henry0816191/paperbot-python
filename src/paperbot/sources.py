@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from dataclasses import dataclass
-from datetime import date, timedelta
+import time
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 import httpx
@@ -34,7 +36,8 @@ class WG21Index:
         )
         self.papers: dict[str, Paper] = {}
         self._max_rev: dict[int, int] = {}   # P-number -> highest revision
-        self._max_p: int = 0                  # highest P-number
+        self._max_p: int = 0                  # absolute highest P-number
+        self._sorted_p_nums: list[int] = []   # sorted unique P-numbers, for gap analysis
 
     async def refresh(self) -> dict[str, Paper]:
         cached = self._cache.read_if_fresh()
@@ -94,10 +97,29 @@ class WG21Index:
                         max_rev[paper.number] = paper.revision
         self._max_rev = max_rev
         self._max_p = max_p
+        self._sorted_p_nums = sorted(max_rev.keys())
         return papers
 
     def highest_p_number(self) -> int:
+        """Absolute highest P-number in the index (may include outliers)."""
         return self._max_p
+
+    def effective_frontier(self, gap_threshold: int = 50) -> int:
+        """Highest P-number in the main cluster of active papers.
+
+        Walks backward from the absolute highest P-number and stops at the
+        first number whose gap to its predecessor is within *gap_threshold*.
+        This filters out isolated high-numbered outliers (e.g. a pre-assigned
+        planning document at P5000 when active work is around P4030) that
+        would otherwise push the frontier window far above actual activity.
+        """
+        nums = self._sorted_p_nums
+        if not nums:
+            return 0
+        for i in range(len(nums) - 1, 0, -1):
+            if nums[i] - nums[i - 1] <= gap_threshold:
+                return nums[i]
+        return nums[0]
 
     def latest_revision(self, number: int) -> int | None:
         rev = self._max_rev.get(number)
@@ -118,8 +140,13 @@ class ProbeHit:
     number: int
     revision: int
     extension: str
+    # Tier labels: "watchlist" | "frontier" | "recent" | "cold"
     tier: str
     front_text: str = ""
+    last_modified: datetime | None = field(default=None)
+    # True when Last-Modified is within alert_modified_hours of now,
+    # or when the header is absent (first-ever discovery of a new file).
+    is_recent: bool = False
 
 
 _TAG_RE = re.compile(r"<[^>]+>")
@@ -131,7 +158,7 @@ async def _fetch_front_text(
     number: int,
     revision: int,
 ) -> str:
-    """GET the HTML version of a paper and return the first ~1000 words as plain text."""
+    """GET the HTML version of a paper and return the first ~1 000 words as plain text."""
     html_url = f"{ISO_BASE}{prefix}{number:04d}R{revision}.html"
     try:
         resp = await client.get(html_url, timeout=15.0)
@@ -146,8 +173,39 @@ async def _fetch_front_text(
         return ""
 
 
+# ── Probe-list entry type ────────────────────────────────────────────────────
+# (url, tier, prefix, number, revision, extension)
+_Entry = tuple[str, str, str, int, int, str]
+
+
 class ISOProber:
-    """Three-tier async HEAD prober for isocpp.org/files/papers/."""
+    """Two-frequency async HEAD prober for isocpp.org/files/papers/.
+
+    Hot list (every cycle, ~30 min):
+      • Watchlist papers
+      • Frontier window around the effective-frontier P-number
+      • Papers active within hot_lookback_months
+
+    Cold list (distributed across cold_cycle_divisor cycles ≈ 24 h):
+      • Every other known P-number (probe for the next unpublished draft)
+      • Every gap number in 1..frontier (may be untracked new assignments)
+
+    Alerting is driven by the HTTP Last-Modified response header rather than
+    our own discovery state.  A hit is flagged is_recent=True when the server
+    reports the file was modified within alert_modified_hours of now, ensuring
+    we only notify about genuinely new or updated drafts.
+    """
+
+    # Keys that _stats is reset to at the start of every run_cycle().
+    _STATS_TEMPLATE: dict[str, int] = {
+        "skipped_discovered": 0,  # URL already in probe_state
+        "skipped_in_index":   0,  # paper_id already in wg21.link index
+        "miss":               0,  # server returned non-200
+        "hit_recent":         0,  # 200 + Last-Modified within alert window
+        "hit_old":            0,  # 200 + Last-Modified outside alert window
+        "hit_no_lm":          0,  # 200 + no Last-Modified header (treated as recent)
+        "error":              0,  # httpx / network exception
+    }
 
     def __init__(
         self,
@@ -159,16 +217,23 @@ class ISOProber:
         self.state = state
         self.cfg = cfg or settings
         self._cycle = 0
+        self._stats: dict[str, int] = dict(self._STATS_TEMPLATE)
+
+    # ── Public API ───────────────────────────────────────────────────────────
 
     async def run_cycle(self) -> list[ProbeHit]:
         self._cycle += 1
+        self._stats = dict(self._STATS_TEMPLATE)
+        t0 = time.monotonic()
+
         urls = self._build_probe_list()
+        hot_count = sum(1 for u in urls if u[1] in ("watchlist", "frontier", "recent"))
+        cold_count = sum(1 for u in urls if u[1] == "cold")
+        slice_idx = (self._cycle - 1) % self.cfg.cold_cycle_divisor
         log.info(
-            "Probe cycle %d: %d URLs (A=%d, B=%d, C=%d)",
-            self._cycle, len(urls),
-            sum(1 for u in urls if u[1] == "A"),
-            sum(1 for u in urls if u[1] == "B"),
-            sum(1 for u in urls if u[1] == "C"),
+            "PROBE-START  cycle=%d  total=%d  hot=%d  cold=%d  slice=%d/%d",
+            self._cycle, len(urls), hot_count, cold_count,
+            slice_idx, self.cfg.cold_cycle_divisor,
         )
 
         sem = asyncio.Semaphore(self.cfg.http_concurrency)
@@ -187,22 +252,153 @@ class ISOProber:
             for r in results:
                 if isinstance(r, ProbeHit):
                     hits.append(r)
+                elif isinstance(r, Exception):
+                    log.debug("Unhandled exception from _probe_one: %s", r)
 
         for hit in hits:
-            self.state.mark_discovered(hit.url)
-            self.state.reset_misses(str(hit.number))
-
-        missed: set[str] = set()
-        for _, tier, prefix, num, rev, ext in urls:
-            key = str(num)
-            if not any(h.number == num for h in hits):
-                missed.add(key)
-        for key in missed:
-            self.state.record_miss(key)
+            lm_ts = hit.last_modified.timestamp() if hit.last_modified else None
+            self.state.mark_discovered(hit.url, last_modified_ts=lm_ts)
 
         self.state.touch_poll()
         self.state.save()
+
+        elapsed = time.monotonic() - t0
+        s = self._stats
+        hit_total = s["hit_recent"] + s["hit_old"] + s["hit_no_lm"]
+        log.info(
+            "PROBE-DONE  cycle=%d  elapsed=%.1fs  total=%d  "
+            "hit=%d(recent=%d old=%d no-lm=%d)  miss=%d  "
+            "skip-disc=%d  skip-idx=%d  err=%d",
+            self._cycle, elapsed, len(urls),
+            hit_total, s["hit_recent"], s["hit_old"], s["hit_no_lm"],
+            s["miss"], s["skipped_discovered"], s["skipped_in_index"], s["error"],
+        )
         return hits
+
+    # ── Probe-list builders ──────────────────────────────────────────────────
+
+    def _build_probe_list(self) -> list[_Entry]:
+        frontier = self.index.effective_frontier(self.cfg.frontier_gap_threshold)
+        hot_known, hot_unknown = self._hot_numbers(frontier)
+        return (
+            self._build_hot_list(frontier, hot_known, hot_unknown)
+            + self._build_cold_slice(self._cycle, frontier, hot_known, hot_unknown)
+        )
+
+    def _hot_numbers(self, frontier: int) -> tuple[set[int], set[int]]:
+        """Return (known_hot, unknown_hot) P-number sets to probe every cycle."""
+        hot: set[int] = set()
+
+        # Watchlist papers
+        hot.update(self.cfg.watchlist_papers)
+
+        # Frontier window
+        lo = max(1, frontier - self.cfg.frontier_window_below + 1)
+        hi = frontier + self.cfg.frontier_window_above
+        hot.update(range(lo, hi + 1))
+        for r in self.cfg.frontier_explicit_ranges:
+            hot.update(range(r.get("min", 0), r.get("max", 0) + 1))
+
+        # Recently active papers
+        if self.cfg.hot_lookback_months > 0:
+            cutoff = date.today() - timedelta(
+                days=int(self.cfg.hot_lookback_months * 30.44)
+            )
+            for p in self.index.papers.values():
+                if p.prefix != "P" or p.number is None or not p.date or p.date == "unknown":
+                    continue
+                try:
+                    if date.fromisoformat(p.date[:10]) >= cutoff:
+                        hot.add(p.number)
+                except ValueError:
+                    continue
+
+        known_p_nums = set(self.index._max_rev.keys())
+        return hot & known_p_nums, hot - known_p_nums
+
+    def _tier_label(self, num: int, watchlist_set: set[int], frontier_range: set[int]) -> str:
+        if num in watchlist_set:
+            return "watchlist"
+        if num in frontier_range:
+            return "frontier"
+        return "recent"
+
+    def _build_hot_list(
+        self,
+        frontier: int,
+        hot_known: set[int],
+        hot_unknown: set[int],
+    ) -> list[_Entry]:
+        results: list[_Entry] = []
+        watchlist_set = set(self.cfg.watchlist_papers)
+        lo = max(1, frontier - self.cfg.frontier_window_below + 1)
+        hi = frontier + self.cfg.frontier_window_above
+        frontier_range: set[int] = set(range(lo, hi + 1))
+        for r in self.cfg.frontier_explicit_ranges:
+            frontier_range.update(range(r.get("min", 0), r.get("max", 0) + 1))
+
+        # Known hot: probe D prefix, latest+1 .. latest+hot_revision_depth
+        for num in sorted(hot_known):
+            tier = self._tier_label(num, watchlist_set, frontier_range)
+            latest = self.index.latest_revision(num)
+            if latest is None:
+                latest = -1
+            for rev in range(latest + 1, latest + self.cfg.hot_revision_depth + 1):
+                for ext in self.cfg.probe_extensions:
+                    url = f"{ISO_BASE}D{num:04d}R{rev}{ext}"
+                    results.append((url, tier, "D", num, rev, ext))
+
+        # Unknown hot (frontier gaps): probe D+P, R0 .. gap_max_rev
+        for num in sorted(hot_unknown):
+            for prefix in self.cfg.probe_prefixes:
+                for rev in range(0, self.cfg.gap_max_rev + 1):
+                    for ext in self.cfg.probe_extensions:
+                        url = f"{ISO_BASE}{prefix}{num:04d}R{rev}{ext}"
+                        results.append((url, "frontier", prefix, num, rev, ext))
+
+        return results
+
+    def _build_cold_slice(
+        self,
+        cycle: int,
+        frontier: int,
+        hot_known: set[int],
+        hot_unknown: set[int],
+    ) -> list[_Entry]:
+        """Return the 1/cold_cycle_divisor slice of cold numbers for this cycle."""
+        slice_idx = (cycle - 1) % self.cfg.cold_cycle_divisor
+        results: list[_Entry] = []
+
+        known_p_nums = set(self.index._max_rev.keys())
+        cold_known = known_p_nums - hot_known
+        all_active = set(range(1, frontier + 1))
+        cold_unknown = all_active - known_p_nums - hot_unknown
+
+        # Cold known: D prefix, latest+1 .. latest+cold_revision_depth
+        for num in sorted(cold_known):
+            if num % self.cfg.cold_cycle_divisor != slice_idx:
+                continue
+            latest = self.index.latest_revision(num)
+            if latest is None:
+                continue
+            for rev in range(latest + 1, latest + self.cfg.cold_revision_depth + 1):
+                for ext in self.cfg.probe_extensions:
+                    url = f"{ISO_BASE}D{num:04d}R{rev}{ext}"
+                    results.append((url, "cold", "D", num, rev, ext))
+
+        # Cold unknown gap numbers: D+P, R0 .. gap_max_rev
+        for num in sorted(cold_unknown):
+            if num % self.cfg.cold_cycle_divisor != slice_idx:
+                continue
+            for prefix in self.cfg.probe_prefixes:
+                for rev in range(0, self.cfg.gap_max_rev + 1):
+                    for ext in self.cfg.probe_extensions:
+                        url = f"{ISO_BASE}{prefix}{num:04d}R{rev}{ext}"
+                        results.append((url, "cold", prefix, num, rev, ext))
+
+        return results
+
+    # ── Single-URL probe ─────────────────────────────────────────────────────
 
     async def _probe_one(
         self,
@@ -216,104 +412,72 @@ class ISOProber:
         tier: str,
     ) -> ProbeHit | None:
         if self.state.is_discovered(url):
+            log.debug("SKIP  disc  %s", url)
+            self._stats["skipped_discovered"] += 1
             return None
         paper_id = f"{prefix}{num:04d}R{rev}"
         if paper_id in self.index.papers:
+            log.debug("SKIP  idx   %s", paper_id)
+            self._stats["skipped_in_index"] += 1
             return None
         async with sem:
             try:
                 resp = await client.head(url)
                 if resp.status_code != 200:
+                    log.debug("MISS  %d  %s", resp.status_code, url)
+                    self._stats["miss"] += 1
                     return None
-                log.info("HIT [%s] %s", tier, url)
-                front_text = await _fetch_front_text(client, prefix, num, rev)
+
+                # Determine recency from the Last-Modified response header.
+                last_modified: datetime | None = None
+                is_recent = False
+                lm_str = resp.headers.get("last-modified")
+                if lm_str:
+                    try:
+                        last_modified = parsedate_to_datetime(lm_str)
+                        threshold = timedelta(hours=self.cfg.alert_modified_hours)
+                        is_recent = (
+                            datetime.now(timezone.utc) - last_modified
+                        ) <= threshold
+                    except Exception:
+                        pass
+                else:
+                    # No Last-Modified: first-ever discovery of an untracked
+                    # file; treat as recent so we don't silently drop it.
+                    is_recent = True
+
+                lm_display = (
+                    last_modified.strftime("%Y-%m-%d %H:%M UTC")
+                    if last_modified else "no-lm"
+                )
+                log.info(
+                    "HIT  tier=%-10s  recent=%-5s  lm=%-20s  %s",
+                    tier, is_recent, lm_display, url,
+                )
+
+                if is_recent and last_modified is not None:
+                    self._stats["hit_recent"] += 1
+                elif not is_recent:
+                    self._stats["hit_old"] += 1
+                else:
+                    self._stats["hit_no_lm"] += 1
+
+                # Only fetch front text when we intend to alert.
+                front_text = ""
+                if is_recent:
+                    front_text = await _fetch_front_text(client, prefix, num, rev)
+
                 return ProbeHit(
                     url=url, prefix=prefix, number=num,
                     revision=rev, extension=ext, tier=tier,
                     front_text=front_text,
+                    last_modified=last_modified,
+                    is_recent=is_recent,
                 )
             except httpx.HTTPError as exc:
-                log.debug("Error probing %s: %s", url, exc)
+                log.debug("ERR   %s  %s", url, exc)
+                self._stats["error"] += 1
         return None
-
-    def _build_probe_list(self) -> list[tuple[str, str, str, int, int, str]]:
-        urls: list[tuple[str, str, str, int, int, str]] = []
-        urls.extend(self._tier_a())
-        urls.extend(self._tier_b())
-        urls.extend(self._tier_c())
-        return urls
-
-    def _tier_a(self) -> list[tuple[str, str, str, int, int, str]]:
-        results: list[tuple[str, str, str, int, int, str]] = []
-        for num in self.cfg.watchlist_papers:
-            latest = self.index.latest_revision(num)
-            for prefix in self.cfg.probe_prefixes:
-                for rev in self._revisions_for(latest):
-                    for ext in self.cfg.probe_extensions:
-                        url = f"{ISO_BASE}{prefix}{num:04d}R{rev}{ext}"
-                        results.append((url, "A", prefix, num, rev, ext))
-        return results
-
-    def _tier_b(self) -> list[tuple[str, str, str, int, int, str]]:
-        results: list[tuple[str, str, str, int, int, str]] = []
-        frontier = self.index.highest_p_number()
-        numbers: set[int] = set()
-        lo = max(1, frontier - self.cfg.frontier_window_below + 1)
-        hi = frontier + self.cfg.frontier_window_above
-        numbers.update(range(lo, hi + 1))
-        for r in self.cfg.frontier_explicit_ranges:
-            numbers.update(range(r.get("min", 0), r.get("max", 0) + 1))
-        for num in sorted(numbers):
-            if self.state.should_skip(
-                str(num), self.cfg.backoff_miss_threshold,
-                self.cfg.backoff_multiplier, self.cfg.backoff_max_skip, self._cycle,
-            ):
-                continue
-            latest = self.index.latest_revision(num)
-            for prefix in self.cfg.probe_prefixes:
-                for rev in self._revisions_for(latest):
-                    for ext in self.cfg.probe_extensions:
-                        url = f"{ISO_BASE}{prefix}{num:04d}R{rev}{ext}"
-                        results.append((url, "B", prefix, num, rev, ext))
-        return results
-
-    def _tier_c(self) -> list[tuple[str, str, str, int, int, str]]:
-        results: list[tuple[str, str, str, int, int, str]] = []
-        cutoff = date.today() - timedelta(days=int(self.cfg.tier_c_lookback_months * 30.44))
-        seen: set[int] = set()
-        for p in self.index.papers.values():
-            if p.prefix != "P" or p.number is None or not p.date or p.date == "unknown":
-                continue
-            try:
-                if date.fromisoformat(p.date[:10]) >= cutoff:
-                    seen.add(p.number)
-            except ValueError:
-                continue
-        watchlist_set = set(self.cfg.watchlist_papers)
-        for num in sorted(seen):
-            if num in watchlist_set:
-                continue
-            if self.state.should_skip(
-                str(num), self.cfg.backoff_miss_threshold,
-                self.cfg.backoff_multiplier, self.cfg.backoff_max_skip, self._cycle,
-            ):
-                continue
-            latest = self.index.latest_revision(num)
-            if latest is None:
-                continue
-            start_rev = latest + 1
-            end_rev = latest + self.cfg.tier_c_revision_depth
-            for prefix in self.cfg.tier_c_probe_prefixes:
-                for rev in range(start_rev, end_rev + 1):
-                    for ext in self.cfg.probe_extensions:
-                        url = f"{ISO_BASE}{prefix}{num:04d}R{rev}{ext}"
-                        results.append((url, "C", prefix, num, rev, ext))
-        return results
-
-    def _revisions_for(self, latest_known: int | None) -> list[int]:
-        if latest_known is None:
-            return list(range(0, self.cfg.probe_unknown_max_rev + 1))
-        return list(range(latest_known, latest_known + self.cfg.probe_revision_depth))
 
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -171,50 +171,52 @@ All parameters are configurable via environment variables or a `.env` file. See 
 |----------|---------|-------------|
 | `POLL_INTERVAL_MINUTES` | `30` | Main polling cycle interval |
 | `ENABLE_BULK_WG21` | `true` | Fetch wg21.link/index.json each cycle |
-| `ENABLE_BULK_OPENSTD` | `true` | Reserved for open-std.org scraping (defined, not yet wired into scheduler) |
+| `ENABLE_BULK_OPENSTD` | `true` | Reserved for open-std.org scraping (not yet scheduled) |
 | `ENABLE_ISO_PROBE` | `true` | Run isocpp.org HEAD probing each cycle |
 
-### Revision Probing
+### Probe Prefixes / Extensions
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PROBE_REVISION_DEPTH` | `3` | Revisions beyond latest known V to probe (V, V+1, V+2) |
-| `PROBE_UNKNOWN_MAX_REV` | `2` | For new numbers, probe R0 through this value |
-| `PROBE_PREFIXES` | `["D","P"]` | Prefixes to probe |
-| `PROBE_EXTENSIONS` | `[".pdf",".html"]` | File extensions to probe |
+| `PROBE_PREFIXES` | `["D","P"]` | Prefixes for gap/unknown numbers |
+| `PROBE_EXTENSIONS` | `[".pdf",".html"]` | File extensions to check |
 
 ### Watchlist
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `WATCHLIST_PAPERS` | `[]` | Paper numbers for full probing (e.g. `[2300, 3482]`) |
+| `WATCHLIST_PAPERS` | `[]` | Paper numbers probed every cycle (e.g. `[2300, 3482]`) |
 | `WATCHLIST_AUTHORS` | `[]` | Author substrings for notifications (e.g. `["Dietmar", "Niebler"]`) |
 
 ### Frontier
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `FRONTIER_WINDOW_ABOVE` | `30` | Numbers above highest known P-number to probe |
-| `FRONTIER_WINDOW_BELOW` | `5` | Numbers below highest known to probe |
-| `FRONTIER_EXPLICIT_RANGES` | `[]` | Explicit ranges, e.g. `[{"min":4033,"max":4042}]` |
+| `FRONTIER_WINDOW_ABOVE` | `30` | Numbers above effective frontier to probe every cycle |
+| `FRONTIER_WINDOW_BELOW` | `5` | Numbers below effective frontier to probe every cycle |
+| `FRONTIER_EXPLICIT_RANGES` | `[]` | Additional explicit ranges, e.g. `[{"min":4033,"max":4060}]` |
+| `FRONTIER_GAP_THRESHOLD` | `50` | Max gap between consecutive P-numbers before treating a number as an outlier (prevents pre-assigned far-future numbers like P5000 from shifting the frontier) |
 
-### Tier C (Recently Active)
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `TIER_C_LOOKBACK_MONTHS` | `18` | Only probe papers active within this window |
-| `TIER_C_PROBE_PREFIXES` | `["D"]` | Lightweight probe prefixes (D-only by default) |
-| `TIER_C_REVISION_DEPTH` | `1` | Revisions beyond V for lightweight probes |
-| `PRUNE_INACTIVE_MONTHS` | `24` | Remove Tier C entries older than this from backoff state |
-
-### Backoff
+### Hot Probing (every 30-min cycle)
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `BACKOFF_MISS_THRESHOLD` | `3` | Consecutive 404s before starting backoff |
-| `BACKOFF_MULTIPLIER` | `2` | Skip-cycles multiplier per miss |
-| `BACKOFF_MAX_SKIP` | `48` | Maximum cycles to skip (48 = 24h at 30-min polling) |
-| `BACKOFF_RESET_ON_INDEX_HIT` | `true` | Reset miss counter when a paper appears in the bulk index |
+| `HOT_LOOKBACK_MONTHS` | `6` | Papers with a date within this window are probed every cycle |
+| `HOT_REVISION_DEPTH` | `2` | Revisions ahead of known latest to probe for hot papers |
+
+### Cold Probing (full coverage, distributed ≈ once per day)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `COLD_REVISION_DEPTH` | `1` | Revisions ahead of known latest for cold papers |
+| `COLD_CYCLE_DIVISOR` | `48` | Cold pool is split into N slices; each cycle probes 1 slice (48 × 30 min = 24 h) |
+| `GAP_MAX_REV` | `1` | For gap/unknown numbers, probe R0 through this revision |
+
+### Timestamp-Based Alerting
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ALERT_MODIFIED_HOURS` | `24` | Only notify for hits where the server's `Last-Modified` header is within this many hours of now. Falls back to "alert" when the header is absent. |
 
 ### HTTP Client
 
@@ -229,10 +231,10 @@ All parameters are configurable via environment variables or a `.env` file. See 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `NOTIFICATION_CHANNEL` | `""` | Slack channel ID for alerts (empty = disabled) |
-| `NOTIFY_ON_WATCHLIST_AUTHOR` | `true` | Notify on watched author match |
-| `NOTIFY_ON_WATCHLIST_PAPER` | `true` | Notify on watched paper new revision |
-| `NOTIFY_ON_FRONTIER_HIT` | `true` | Notify on frontier discovery |
-| `NOTIFY_ON_TIER_C_HIT` | `true` | Notify on Tier C D-paper discovery |
+| `NOTIFY_ON_WATCHLIST_AUTHOR` | `true` | Notify on watched author match in index |
+| `NOTIFY_ON_WATCHLIST_PAPER` | `true` | Notify on recently modified draft for a watchlist paper |
+| `NOTIFY_ON_FRONTIER_HIT` | `true` | Notify on recently modified draft near the frontier |
+| `NOTIFY_ON_ANY_DRAFT` | `true` | Notify on any other recently modified draft |
 
 ### Storage
 
@@ -257,17 +259,29 @@ paperbot-python/
   tests/
 ```
 
-### Three-Tier Probing Strategy
+### Two-Frequency Probing Strategy
 
-| Tier | What | Requests/number | Typical total |
-|------|------|----------------|---------------|
-| A | Watchlist papers | 12 (D/P × 3 revisions × pdf/html) | 60–240 |
-| B | Frontier numbers | 12 | 240–480 |
-| C | Recently active | 2 (D-only, V+1, pdf+html) | 600–800 |
+Every P-number from 1 to the effective frontier is probed. Numbers are divided into a **hot** set (probed every 30 min) and a **cold** pool (probed once per day by distributing 1/48 of the pool each cycle).
 
-Bulk indexes (wg21.link) handle published P/N papers with a single HTTP request per cycle. The prober only targets D-papers and not-yet-indexed revisions.
+| Frequency | What | Condition | Per-cycle URLs |
+|-----------|------|-----------|----------------|
+| **Hot** (every cycle) | Watchlist papers | `WATCHLIST_PAPERS` list | D-prefix, latest+1..+2, pdf+html |
+| **Hot** (every cycle) | Frontier numbers | ±window around effective frontier | D+P, R0..R1 for unknowns; D, latest+1..+2 for known |
+| **Hot** (every cycle) | Recently active papers | date within `HOT_LOOKBACK_MONTHS` | D-prefix, latest+1..+2, pdf+html |
+| **Cold** (1/48 per cycle ≈ daily) | All other P-numbers | everything else | D-prefix, latest+1, pdf+html |
+| **Cold** (1/48 per cycle) | Gap numbers (no index entry) | 1..frontier minus known | D+P, R0..R1, pdf+html |
 
-Adaptive backoff reduces repeat probing of consistently missing numbers: after `BACKOFF_MISS_THRESHOLD` consecutive 404s, a number is skipped for an exponentially growing number of cycles (capped at `BACKOFF_MAX_SKIP`).
+Typical per-cycle request count: **~1,600–2,000 HEAD requests** (~8–10 s at 20 concurrent, 100 ms latency). A full sweep of all ~4,000 P-numbers completes within ~24 h of continuous 30-min polling.
+
+### Alerting by Last-Modified
+
+When a HEAD probe returns 200, the bot reads the `Last-Modified` response header. It only sends a Slack notification if the file was modified within `ALERT_MODIFIED_HOURS` (default 24 h). This means:
+
+- A D-paper uploaded today → **alert sent**
+- A D-paper uploaded 6 months ago that we hadn't tracked → **silently added to discovered, no alert**
+- No `Last-Modified` header (unusual) → treated as recent, **alert sent**
+
+The `Last-Modified` timestamp is shown in every notification message.
 
 ## Data Sources
 

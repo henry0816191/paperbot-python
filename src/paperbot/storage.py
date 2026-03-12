@@ -58,18 +58,39 @@ class JsonCache:
 # ── Probe State ─────────────────────────────────────────────────────────────
 
 class ProbeState:
-    """Persists probe results: discovered URLs, miss counters, last poll time."""
+    """Persists probe results: discovered URLs, miss counters, last poll time.
+
+    Schema for each entry in ``discovered``:
+        {
+          "last_modified": float | null,   # server Last-Modified as Unix timestamp
+          "discovered_at": float           # our wall-clock time when first found
+        }
+
+    Older entries written as bare floats are migrated transparently on load:
+    the float is treated as ``discovered_at`` with ``last_modified`` set to null.
+    """
 
     def __init__(self, path: Path):
         self._cache = JsonCache(path, ttl_hours=float("inf"))
-        self._data: dict = self._cache.read() or {
-            "discovered": {},
-            "miss_counts": {},
-            "last_poll": 0.0,
+        raw: dict = self._cache.read() or {}
+        self._data: dict = {
+            "discovered": raw.get("discovered", {}),
+            "miss_counts": raw.get("miss_counts", {}),
+            "last_poll": raw.get("last_poll", 0.0),
         }
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Upgrade any bare-float discovered entries to the current dict schema."""
+        for url, val in list(self._data["discovered"].items()):
+            if not isinstance(val, dict):
+                self._data["discovered"][url] = {
+                    "last_modified": None,
+                    "discovered_at": float(val),
+                }
 
     @property
-    def discovered(self) -> dict[str, float]:
+    def discovered(self) -> dict[str, dict]:
         return self._data.setdefault("discovered", {})
 
     @property
@@ -80,12 +101,25 @@ class ProbeState:
     def last_poll(self) -> float:
         return self._data.get("last_poll", 0.0)
 
-    def mark_discovered(self, url: str) -> None:
+    def mark_discovered(self, url: str, last_modified_ts: float | None = None) -> None:
+        """Record *url* as discovered.
+
+        *last_modified_ts* should be the server's ``Last-Modified`` header value
+        converted to a Unix timestamp.  When absent, the field is stored as null.
+        This is intentionally separate from ``discovered_at`` (our own wall-clock).
+        """
         if url not in self.discovered:
-            self.discovered[url] = time.time()
+            self.discovered[url] = {
+                "last_modified": last_modified_ts,
+                "discovered_at": time.time(),
+            }
 
     def is_discovered(self, url: str) -> bool:
         return url in self.discovered
+
+    def discovered_info(self, url: str) -> dict | None:
+        """Return the stored metadata dict for *url*, or None if not recorded."""
+        return self.discovered.get(url)
 
     def record_miss(self, paper_num: str) -> None:
         self.miss_counts[paper_num] = self.miss_counts.get(paper_num, 0) + 1

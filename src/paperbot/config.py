@@ -20,38 +20,50 @@ class Settings(BaseSettings):
 
     # -- Scheduling --
     poll_interval_minutes: int = 30
+    # Minimum seconds to sleep after an overrun cycle (poll took longer than
+    # poll_interval_minutes).  Acts as a short cooldown before the next cycle.
+    poll_overrun_cooldown_seconds: int = 300   # 5 min
     enable_bulk_wg21: bool = True
     enable_bulk_openstd: bool = True
     enable_iso_probe: bool = True
 
-    # -- Revision probing --
-    probe_revision_depth: int = 3
-    probe_unknown_max_rev: int = 2
+    # -- Paper prefixes / extensions (globals used for gap/unknown numbers) --
     probe_prefixes: list[str] = Field(default_factory=lambda: ["D", "P"])
     probe_extensions: list[str] = Field(default_factory=lambda: [".pdf", ".html"])
 
-    # -- Tier A: Watchlist --
+    # -- Watchlist --
     watchlist_papers: list[int] = Field(default_factory=list)
     watchlist_authors: list[str] = Field(default_factory=list)
 
-    # -- Tier B: Frontier --
+    # -- Frontier (Tier B equivalent) --
     frontier_window_above: int = 30
     frontier_window_below: int = 5
     frontier_explicit_ranges: list[dict[str, int]] = Field(default_factory=list)
+    # Max gap between consecutive P-numbers before a number is treated as an
+    # outlier (e.g. a pre-assigned planning doc at P5000 while work is at P4032).
+    frontier_gap_threshold: int = 50
 
-    # -- Tier C: Recently active --
-    tier_c_lookback_months: int = 18
-    tier_c_probe_prefixes: list[str] = Field(default_factory=lambda: ["D"])
-    tier_c_revision_depth: int = 1
+    # -- Hot probing (every poll cycle) --
+    # Papers with a date within this window are probed every cycle.
+    hot_lookback_months: int = 6
+    # How many revisions ahead of the known latest to probe for hot papers.
+    hot_revision_depth: int = 2
 
-    # -- Adaptive backoff --
-    backoff_miss_threshold: int = 3
-    backoff_multiplier: int = 2
-    backoff_max_skip: int = 48
-    backoff_reset_on_index_hit: bool = True
+    # -- Cold probing (full coverage, distributed over N cycles ≈ once/day) --
+    # How many revisions ahead of the known latest to probe for cold papers.
+    cold_revision_depth: int = 1
+    # Distribute the cold pool over this many cycles (48 × 30 min = 24 h).
+    cold_cycle_divisor: int = 48
 
-    # -- Tier C pruning --
-    prune_inactive_months: int = 24
+    # -- Gap / unknown numbers (no index entry) --
+    # Probe R0 through this revision for numbers not in the index at all.
+    gap_max_rev: int = 1
+
+    # -- Timestamp-based alerting --
+    # Only notify for probe hits where the server's Last-Modified header is
+    # within this many hours of now.  Falls back to "alert" when the header
+    # is absent (first-ever discovery of an untracked file).
+    alert_modified_hours: int = 24
 
     # -- HTTP client --
     http_concurrency: int = 20
@@ -63,11 +75,21 @@ class Settings(BaseSettings):
     notify_on_watchlist_author: bool = True
     notify_on_watchlist_paper: bool = True
     notify_on_frontier_hit: bool = True
-    notify_on_tier_c_hit: bool = True
+    notify_on_any_draft: bool = True
+    # Alert when a D-paper we previously probed appears in the wg21.link index
+    # as its published P counterpart (D1234R1 → P1234R1).
+    notify_on_dp_transition: bool = True
 
     # -- Storage --
     data_dir: Path = Path("./data")
     cache_ttl_hours: int = 1
+
+    # -- Logging --
+    # Console log level.  The rotating file (data_dir/paperbot.log) always
+    # captures DEBUG so nothing is lost for post-hoc analysis.
+    log_level: str = "INFO"
+    # Days of log files to keep (one file per day).
+    log_retention_days: int = 7
 
 
 settings = Settings()
