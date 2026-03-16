@@ -8,9 +8,12 @@ import sys
 import threading
 from pathlib import Path
 
+from datetime import datetime, timezone
+
 from .config import settings
 from .bot import MessageQueue, create_app, notify_channel, notify_users, register_handlers
 from .db import init_db, init_pool
+from .health import start_health_server
 from .monitor import Scheduler
 from .sources import ISOProber, WG21Index
 from .storage import ProbeState, UserWatchlist
@@ -86,6 +89,8 @@ async def _async_main() -> None:
         log.error("DATABASE_URL is not set — cannot start")
         sys.exit(1)
 
+    launch_time = datetime.now(timezone.utc)
+
     pool = init_pool(settings.database_url)
     init_db(pool)
 
@@ -96,6 +101,8 @@ async def _async_main() -> None:
     app = create_app()
     mq = MessageQueue(app)
     mq.start()
+
+    paper_count_fn = lambda: len(index.papers)
 
     scheduler = Scheduler(
         index=index,
@@ -108,8 +115,9 @@ async def _async_main() -> None:
         ),
     )
 
-    register_handlers(app, user_watchlist, state, lambda: len(index.papers))
+    register_handlers(app, user_watchlist, state, paper_count_fn, launch_time)
 
+    start_health_server(settings.health_port, launch_time, state, paper_count_fn)
     log.info("Starting Slack Bolt app on port %d", settings.port)
     bolt_thread = threading.Thread(
         target=app.start, kwargs={"port": settings.port}, daemon=True,

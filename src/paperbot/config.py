@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     slack_signing_secret: str = ""
     slack_bot_token: str = ""
     port: int = 3000
+    health_port: int = 8080
 
     # -- Scheduling --
     poll_interval_minutes: int = 30

@@ -14,7 +14,10 @@ from paperbot.bot import (
     MessageQueue,
     _batch_lines,
     _fmt_lm,
+    _format_uptime,
     _handle_status,
+    _handle_uptime,
+    _handle_version,
     _handle_watchlist,
     _hit_label,
     _paper_link,
@@ -656,6 +659,124 @@ class TestRegisterHandlers:
             say=say,
         )
         say.assert_not_called()
+
+
+# ── _handle_version ───────────────────────────────────────────────────────────
+
+class TestHandleVersion:
+    def test_version_contains_version_string(self):
+        say = MagicMock()
+        with patch("paperbot.__version__", "1.2.3"):
+            _handle_version(say, {})
+        text = say.call_args[1]["text"]
+        assert "1.2.3" in text
+        assert "Paperbot" in text
+
+    def test_version_forwards_reply_opts(self):
+        say = MagicMock()
+        _handle_version(say, {"thread_ts": "t1"})
+        assert say.call_args[1]["thread_ts"] == "t1"
+
+
+# ── _format_uptime / _handle_uptime ──────────────────────────────────────────
+
+class TestUptime:
+    def test_format_uptime_minutes_only(self):
+        delta = timedelta(minutes=5)
+        assert _format_uptime(delta) == "5m"
+
+    def test_format_uptime_hours_and_minutes(self):
+        delta = timedelta(hours=3, minutes=12)
+        assert _format_uptime(delta) == "3h 12m"
+
+    def test_format_uptime_days_hours_minutes(self):
+        delta = timedelta(days=2, hours=1, minutes=45)
+        assert _format_uptime(delta) == "2d 1h 45m"
+
+    def test_format_uptime_zero(self):
+        delta = timedelta(seconds=0)
+        assert _format_uptime(delta) == "0m"
+
+    def test_handle_uptime_with_launch_time(self):
+        say = MagicMock()
+        launch = datetime(2026, 3, 16, 10, 0, 0, tzinfo=timezone.utc)
+        now = datetime(2026, 3, 16, 13, 30, 0, tzinfo=timezone.utc)
+        with patch("paperbot.bot.datetime") as mock_dt:
+            mock_dt.now.return_value = now
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+            _handle_uptime(launch, say, {})
+        text = say.call_args[1]["text"]
+        assert "started" in text.lower()
+        assert "3h 30m" in text
+        assert "2026-03-16 10:00:00 UTC" in text
+
+    def test_handle_uptime_no_launch_time(self):
+        say = MagicMock()
+        _handle_uptime(None, say, {})
+        assert "not available" in say.call_args[1]["text"].lower()
+
+    def test_handle_uptime_forwards_reply_opts(self):
+        say = MagicMock()
+        launch = datetime.now(timezone.utc) - timedelta(hours=1)
+        _handle_uptime(launch, say, {"thread_ts": "t1"})
+        assert say.call_args[1]["thread_ts"] == "t1"
+
+
+# ── dispatch: version / uptime ────────────────────────────────────────────────
+
+class TestDispatchVersionUptime:
+    def _setup(self, fake_pool, launch_time=None):
+        app = MagicMock()
+        registered: dict = {}
+
+        def capture_event(name):
+            def decorator(fn):
+                registered[name] = fn
+                return fn
+            return decorator
+
+        app.event.side_effect = capture_event
+        user_watchlist = UserWatchlist(fake_pool)
+        state = ProbeState(fake_pool)
+        register_handlers(app, user_watchlist, state, lambda: 99, launch_time)
+        return registered
+
+    def test_dispatch_version(self, fake_pool):
+        registered = self._setup(fake_pool)
+        say = MagicMock()
+        registered["message"](
+            event={"text": "version", "channel_type": "im", "ts": "1", "user": "U1"},
+            context={"bot_user_id": "U1"},
+            say=say,
+        )
+        say.assert_called_once()
+        assert "Paperbot" in say.call_args[1]["text"]
+
+    def test_dispatch_uptime(self, fake_pool):
+        launch = datetime.now(timezone.utc) - timedelta(hours=2, minutes=15)
+        registered = self._setup(fake_pool, launch_time=launch)
+        say = MagicMock()
+        registered["message"](
+            event={"text": "uptime", "channel_type": "im", "ts": "1", "user": "U1"},
+            context={"bot_user_id": "U1"},
+            say=say,
+        )
+        say.assert_called_once()
+        text = say.call_args[1]["text"]
+        assert "started" in text.lower()
+        assert "2h 15m" in text
+
+    def test_help_mentions_version_and_uptime(self, fake_pool):
+        registered = self._setup(fake_pool)
+        say = MagicMock()
+        registered["message"](
+            event={"text": "help", "channel_type": "im", "ts": "1", "user": "U1"},
+            context={"bot_user_id": "U1"},
+            say=say,
+        )
+        text = say.call_args[1]["text"]
+        assert "version" in text
+        assert "uptime" in text
 
 
 # ── create_app ────────────────────────────────────────────────────────────────

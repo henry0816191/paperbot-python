@@ -254,6 +254,7 @@ def register_handlers(
     user_watchlist: UserWatchlist,
     state: ProbeState,
     paper_count_fn,
+    launch_time: datetime | None = None,
 ) -> None:
 
     def _dispatch(text: str, user_id: str, channel_type: str, say, reply_opts: dict) -> None:
@@ -265,6 +266,10 @@ def register_handlers(
             _route_watchlist(words[1:], user_id, channel_type, say, reply_opts)
         elif cmd == "status":
             _handle_status(state, paper_count_fn, say, reply_opts)
+        elif cmd == "version":
+            _handle_version(say, reply_opts)
+        elif cmd == "uptime":
+            _handle_uptime(launch_time, say, reply_opts)
         elif cmd == "help":
             say(
                 text=(
@@ -272,6 +277,8 @@ def register_handlers(
                     "• `watchlist add|remove|list [name-or-paper-number]` — "
                     "manage your personal watchlist (DM only)\n"
                     "• `status` — show bot status\n"
+                    "• `version` — show bot version\n"
+                    "• `uptime` — show how long the bot has been running\n"
                     "• `help` — this message"
                 ),
                 **reply_opts,
@@ -420,5 +427,37 @@ def _handle_status(state: ProbeState, paper_count_fn, say, reply_opts: dict) -> 
             f"• Alert window: {settings.alert_modified_hours}h\n"
             f"• Cold cycle: 1/{settings.cold_cycle_divisor}"
         ),
+        **reply_opts,
+    )
+
+
+def _handle_version(say, reply_opts: dict) -> None:
+    from . import __version__
+    say(text=f"Paperbot v{__version__}", **reply_opts)
+
+
+def _format_uptime(delta) -> str:
+    total_seconds = int(delta.total_seconds())
+    days, remainder = divmod(total_seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, _ = divmod(remainder, 60)
+    parts: list[str] = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    parts.append(f"{minutes}m")
+    return " ".join(parts)
+
+
+def _handle_uptime(launch_time: datetime | None, say, reply_opts: dict) -> None:
+    if launch_time is None:
+        say(text="Uptime information is not available.", **reply_opts)
+        return
+    now = datetime.now(timezone.utc)
+    delta = now - launch_time
+    started_str = launch_time.strftime("%Y-%m-%d %H:%M:%S UTC")
+    say(
+        text=f"Paperbot started {_format_uptime(delta)} ago ({started_str})",
         **reply_opts,
     )
