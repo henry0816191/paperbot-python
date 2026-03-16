@@ -9,10 +9,11 @@ import threading
 from pathlib import Path
 
 from .config import settings
-from .bot import create_app, notify_channel, register_handlers
-from .monitor import Scheduler, Watchlist
+from .bot import MessageQueue, create_app, notify_channel, notify_users, register_handlers
+from .db import init_db, init_pool
+from .monitor import Scheduler
 from .sources import ISOProber, WG21Index
-from .storage import ProbeState
+from .storage import ProbeState, UserWatchlist
 
 log = logging.getLogger("paperbot")
 
@@ -34,7 +35,6 @@ def _setup_logging(data_dir: Path, console_level: str = "INFO",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    # ── File handler ─────────────────────────────────────────────────────────
     fh = logging.handlers.TimedRotatingFileHandler(
         filename=data_dir / "paperbot.log",
         when="midnight",
@@ -45,19 +45,17 @@ def _setup_logging(data_dir: Path, console_level: str = "INFO",
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(fmt)
 
-    # ── Console handler ───────────────────────────────────────────────────────
     ch = logging.StreamHandler(sys.stderr)
     ch.setLevel(getattr(logging, console_level.upper(), logging.INFO))
     ch.setFormatter(fmt)
 
     root = logging.getLogger()
-    root.setLevel(logging.DEBUG)          # let handlers decide their own cutoff
+    root.setLevel(logging.DEBUG)
     root.addHandler(fh)
     root.addHandler(ch)
 
-    # Silence noisy libraries
     for lib in ("httpx", "httpcore", "slack_bolt", "slack_sdk",
-                "apscheduler", "urllib3"):
+                "apscheduler", "urllib3", "psycopg2"):
         logging.getLogger(lib).setLevel(logging.WARNING)
 
 
@@ -84,28 +82,33 @@ async def _async_main() -> None:
         settings.gap_max_rev, settings.frontier_gap_threshold,
     )
 
-    index = WG21Index(data_dir)
-    state = ProbeState(data_dir / "probe_state.json")
-    watchlist = Watchlist(data_dir / "watchlist.json")
+    if not settings.database_url:
+        log.error("DATABASE_URL is not set — cannot start")
+        sys.exit(1)
 
-    for author in settings.watchlist_authors:
-        watchlist.add_author(author)
+    pool = init_pool(settings.database_url)
+    init_db(pool)
 
-    log.info(
-        "Watchlist: %d authors  %d watched papers",
-        len(watchlist.authors), len(settings.watchlist_papers),
-    )
-
-    prober = ISOProber(index, state)
+    state = ProbeState(pool)
+    user_watchlist = UserWatchlist(pool)
+    index = WG21Index(pool)
+    prober = ISOProber(index, state, user_watchlist)
     app = create_app()
+    mq = MessageQueue(app)
+    mq.start()
 
     scheduler = Scheduler(
-        index=index, prober=prober,
-        watchlist=watchlist, state=state,
-        notify_callback=lambda result: notify_channel(app, result, watchlist),
+        index=index,
+        prober=prober,
+        user_watchlist=user_watchlist,
+        state=state,
+        notify_callback=lambda result: (
+            notify_channel(app, result, mq),
+            notify_users(app, result, mq),
+        ),
     )
 
-    register_handlers(app, watchlist, state, lambda: len(index.papers))
+    register_handlers(app, user_watchlist, state, lambda: len(index.papers))
 
     log.info("Starting Slack Bolt app on port %d", settings.port)
     bolt_thread = threading.Thread(

@@ -12,6 +12,7 @@ dependencies = [
     "httpx[http2]",
     "pydantic-settings",
     "apscheduler>=4.0.0a,<5",
+    "psycopg2-binary",
 ]
 
 [project.optional-dependencies]

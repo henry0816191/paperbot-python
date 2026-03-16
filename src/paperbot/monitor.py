@@ -1,22 +1,20 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
 
 from .config import Settings, settings
 from .models import Paper
 from .sources import ISOProber, ProbeHit, WG21Index
-from .storage import ProbeState
+from .storage import ProbeState, UserWatchlist
 
 log = logging.getLogger(__name__)
 
 
-# ── Diff Engine ─────────────────────────────────────────────────────────────
+# ── Diff Engine ──────────────────────────────────────────────────────────────
 
 @dataclass(slots=True)
 class DiffResult:
@@ -45,59 +43,20 @@ def diff_snapshots(
     return DiffResult(new_papers=new_papers, updated_papers=updated_papers)
 
 
-# ── Watchlist ───────────────────────────────────────────────────────────────
+# ── Per-User Matches ─────────────────────────────────────────────────────────
 
-class Watchlist:
-    """Author watchlist with persistent JSON storage."""
+@dataclass
+class PerUserMatches:
+    """Watchlist matches for a single Slack user in one poll cycle.
 
-    def __init__(self, path: Path):
-        self.path = path
-        self._authors: list[str] = []
-        self._load()
-
-    def _load(self) -> None:
-        if self.path.exists():
-            try:
-                data = json.loads(self.path.read_text(encoding="utf-8"))
-                self._authors = [a.lower() for a in data.get("authors", [])]
-            except (json.JSONDecodeError, OSError) as exc:
-                log.warning("Failed to load watchlist: %s", exc)
-
-    def _save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(
-            json.dumps({"authors": self._authors}, indent=2),
-            encoding="utf-8",
-        )
-
-    @property
-    def authors(self) -> list[str]:
-        return list(self._authors)
-
-    def add_author(self, name: str) -> bool:
-        key = name.lower().strip()
-        if key and key not in self._authors:
-            self._authors.append(key)
-            self._save()
-            return True
-        return False
-
-    def remove_author(self, name: str) -> bool:
-        key = name.lower().strip()
-        if key in self._authors:
-            self._authors.remove(key)
-            self._save()
-            return True
-        return False
-
-    def matches(self, paper: Paper) -> list[str]:
-        if not paper.author:
-            return []
-        author_lower = paper.author.lower()
-        return [a for a in self._authors if a in author_lower]
+    Each entry in *papers* and *probe_hits* is a ``(item, match_reason)``
+    tuple where ``match_reason`` is ``'author'`` or ``'paper'``.
+    """
+    papers: list[tuple[Paper, str]] = field(default_factory=list)
+    probe_hits: list[tuple[ProbeHit, str]] = field(default_factory=list)
 
 
-# ── Poll Result ─────────────────────────────────────────────────────────────
+# ── Poll Result ──────────────────────────────────────────────────────────────
 
 @dataclass(slots=True)
 class DPTransition:
@@ -119,20 +78,16 @@ class PollResult:
         self,
         diff: DiffResult,
         probe_hits: list[ProbeHit],
-        watchlist_matches: list[Paper],
-        probe_watchlist_hits: list[ProbeHit] | None = None,
         dp_transitions: list[DPTransition] | None = None,
+        per_user_matches: dict[str, PerUserMatches] | None = None,
     ):
         self.diff = diff
-        # Only hits flagged is_recent=True are actionable
         self.probe_hits = probe_hits
-        self.watchlist_matches = watchlist_matches
-        self.probe_watchlist_hits = probe_watchlist_hits or []
-        # D-papers that have now appeared in the wg21.link index as P-papers
         self.dp_transitions = dp_transitions or []
+        self.per_user_matches = per_user_matches or {}
 
 
-# ── Scheduler ───────────────────────────────────────────────────────────────
+# ── Scheduler ────────────────────────────────────────────────────────────────
 
 class Scheduler:
     """Coordinates periodic polling: index refresh + ISO probing + notifications."""
@@ -141,14 +96,14 @@ class Scheduler:
         self,
         index: WG21Index,
         prober: ISOProber,
-        watchlist: Watchlist,
+        user_watchlist: UserWatchlist,
         state: ProbeState,
         cfg: Settings | None = None,
         notify_callback=None,
     ):
         self.index = index
         self.prober = prober
-        self.watchlist = watchlist
+        self.user_watchlist = user_watchlist
         self.state = state
         self.cfg = cfg or settings
         self.notify_callback = notify_callback
@@ -190,7 +145,7 @@ class Scheduler:
             await self.seed()
             return PollResult(
                 diff=DiffResult(new_papers=[], updated_papers=[]),
-                probe_hits=[], watchlist_matches=[],
+                probe_hits=[],
             )
 
         previous = dict(self._previous_papers)
@@ -218,7 +173,6 @@ class Scheduler:
         if self.cfg.enable_iso_probe:
             probe_hits = await self.prober.run_cycle()
 
-        # Only surface hits the server says are recently modified.
         recent_hits = [h for h in probe_hits if h.is_recent]
         old_hits    = [h for h in probe_hits if not h.is_recent]
 
@@ -229,31 +183,7 @@ class Scheduler:
                 len(old_hits), self.cfg.alert_modified_hours,
             )
 
-        # Index diff: watchlist author matches in newly published papers
-        watchlist_matches: list[Paper] = []
-        for paper in diff.new_papers:
-            if self.watchlist.matches(paper):
-                watchlist_matches.append(paper)
-                log.info(
-                    "WATCHLIST-MATCH  id=%s  author=%r",
-                    paper.id, paper.author,
-                )
-
-        # Probe hits: watchlist author name appears in the draft's front text
-        probe_watchlist_hits: list[ProbeHit] = []
-        for hit in recent_hits:
-            if hit.front_text:
-                text_lower = hit.front_text.lower()
-                if any(a in text_lower for a in self.watchlist.authors):
-                    probe_watchlist_hits.append(hit)
-                    log.info(
-                        "PROBE-WATCHLIST  %s  tier=%s",
-                        hit.url, hit.tier,
-                    )
-
-        # D→P transitions: newly indexed P-papers whose D-paper URL we already
-        # have on record in probe_state.  Each revision of a paper has distinct
-        # URLs so one paper can have at most one transition event per revision.
+        # D→P transitions
         dp_transitions: list[DPTransition] = []
         for paper in diff.new_papers:
             if paper.number is None or paper.revision is None or paper.prefix != "P":
@@ -282,14 +212,25 @@ class Scheduler:
                         datetime.fromtimestamp(disc_ts, tz=timezone.utc).strftime("%Y-%m-%d")
                         if disc_ts else "unknown",
                     )
-                    break  # one transition per paper is enough
+                    break
+
+        # Per-user watchlist matching
+        per_user_matches = await asyncio.to_thread(
+            self.user_watchlist.matches_for_users,
+            diff.new_papers,
+            recent_hits,
+        )
+        for uid, m in per_user_matches.items():
+            log.info(
+                "WATCHLIST-MATCH  user=%s  papers=%d  probe_hits=%d",
+                uid, len(m.papers), len(m.probe_hits),
+            )
 
         result = PollResult(
             diff=diff,
             probe_hits=recent_hits,
-            watchlist_matches=watchlist_matches,
-            probe_watchlist_hits=probe_watchlist_hits,
             dp_transitions=dp_transitions,
+            per_user_matches=per_user_matches,
         )
         if self.notify_callback:
             self.notify_callback(result)
@@ -299,12 +240,11 @@ class Scheduler:
             "POLL-DONE  poll=%d  elapsed=%.1fs  "
             "index-new=%d  index-upd=%d  "
             "probe-recent=%d  probe-old=%d  "
-            "watchlist=%d  probe-watchlist=%d  dp-transitions=%d",
+            "dp-transitions=%d  users-notified=%d",
             self._poll_count, elapsed,
             len(diff.new_papers), len(diff.updated_papers),
             len(recent_hits), len(old_hits),
-            len(watchlist_matches), len(probe_watchlist_hits),
-            len(dp_transitions),
+            len(dp_transitions), len(per_user_matches),
         )
         return result
 
@@ -325,10 +265,6 @@ class Scheduler:
                 log.exception("POLL-ERROR  poll=%d", self._poll_count)
             elapsed = time.monotonic() - t0
 
-            # Sleep the remainder of the target interval so that the effective
-            # period is poll_interval_minutes regardless of how long probing
-            # took.  If the cycle overran the interval, sleep poll_overrun_cooldown_seconds
-            # as a brief cooldown before immediately starting the next cycle.
             sleep_for = max(interval - elapsed, cooldown)
             log.info(
                 "SCHEDULER-SLEEP  sleep=%.0fs  (poll=%.0fs  interval=%ds)",

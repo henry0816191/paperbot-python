@@ -31,13 +31,12 @@ class Settings(BaseSettings):
     probe_prefixes: list[str] = Field(default_factory=lambda: ["D", "P"])
     probe_extensions: list[str] = Field(default_factory=lambda: [".pdf", ".html"])
 
-    # -- Watchlist --
-    watchlist_papers: list[int] = Field(default_factory=list)
-    watchlist_authors: list[str] = Field(default_factory=list)
+    # -- Database --
+    database_url: str = ""
 
     # -- Frontier (Tier B equivalent) --
-    frontier_window_above: int = 30
-    frontier_window_below: int = 5
+    frontier_window_above: int = 60
+    frontier_window_below: int = 30
     frontier_explicit_ranges: list[dict[str, int]] = Field(default_factory=list)
     # Max gap between consecutive P-numbers before a number is treated as an
     # outlier (e.g. a pre-assigned planning doc at P5000 while work is at P4032).
@@ -72,8 +71,6 @@ class Settings(BaseSettings):
 
     # -- Notifications --
     notification_channel: str = ""
-    notify_on_watchlist_author: bool = True
-    notify_on_watchlist_paper: bool = True
     notify_on_frontier_hit: bool = True
     notify_on_any_draft: bool = True
     # Alert when a D-paper we previously probed appears in the wg21.link index

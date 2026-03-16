@@ -7,13 +7,11 @@ import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
-from pathlib import Path
-
 import httpx
 
 from .config import Settings, settings
 from .models import Paper
-from .storage import JsonCache, ProbeState
+from .storage import PaperCache, ProbeState, UserWatchlist
 
 log = logging.getLogger(__name__)
 
@@ -28,12 +26,8 @@ WG21_INDEX_URL = "https://wg21.link/index.json"
 class WG21Index:
     """Fetch, cache, and parse the wg21.link paper index."""
 
-    def __init__(self, data_dir: Path | None = None):
-        data_dir = data_dir or settings.data_dir
-        self._cache = JsonCache(
-            data_dir / "paper_cache.json",
-            ttl_hours=settings.cache_ttl_hours,
-        )
+    def __init__(self, pool):
+        self._cache = PaperCache(pool, ttl_hours=settings.cache_ttl_hours)
         self.papers: dict[str, Paper] = {}
         self._max_rev: dict[int, int] = {}   # P-number -> highest revision
         self._max_p: int = 0                  # absolute highest P-number
@@ -211,10 +205,12 @@ class ISOProber:
         self,
         index: WG21Index,
         state: ProbeState,
+        user_watchlist: UserWatchlist,
         cfg: Settings | None = None,
     ):
         self.index = index
         self.state = state
+        self.user_watchlist = user_watchlist
         self.cfg = cfg or settings
         self._cycle = 0
         self._stats: dict[str, int] = dict(self._STATS_TEMPLATE)
@@ -289,8 +285,8 @@ class ISOProber:
         """Return (known_hot, unknown_hot) P-number sets to probe every cycle."""
         hot: set[int] = set()
 
-        # Watchlist papers
-        hot.update(self.cfg.watchlist_papers)
+        # Watchlist papers (union across all users)
+        hot.update(self.user_watchlist.get_all_watched_paper_nums())
 
         # Frontier window
         lo = max(1, frontier - self.cfg.frontier_window_below + 1)
@@ -330,7 +326,7 @@ class ISOProber:
         hot_unknown: set[int],
     ) -> list[_Entry]:
         results: list[_Entry] = []
-        watchlist_set = set(self.cfg.watchlist_papers)
+        watchlist_set = self.user_watchlist.get_all_watched_paper_nums()
         lo = max(1, frontier - self.cfg.frontier_window_below + 1)
         hi = frontier + self.cfg.frontier_window_above
         frontier_range: set[int] = set(range(lo, hi + 1))

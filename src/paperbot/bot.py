@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import logging
+import queue
+import threading
+import time
 from datetime import datetime, timezone
 
 from slack_bolt import App
+from slack_sdk.errors import SlackApiError
 
 from .config import settings
 from .models import Paper
-from .monitor import DPTransition, PollResult, Watchlist
-from .storage import ProbeState
+from .monitor import DPTransition, PerUserMatches, PollResult
+from .sources import ProbeHit
+from .storage import ProbeState, UserWatchlist
 
 log = logging.getLogger(__name__)
 
@@ -23,14 +28,85 @@ def create_app() -> App:
 SLACK_MAX_TEXT = 3000
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
+# ── Message Queue ─────────────────────────────────────────────────────────────
+
+class MessageQueue:
+    """Thread-safe, rate-limited Slack ``chat.postMessage`` queue.
+
+    Maintains a 1-message-per-second-per-channel limit and honours the
+    ``Retry-After`` header on HTTP 429 responses.  All channel and DM posts
+    go through this queue so the polling loop is never blocked by Slack I/O.
+    """
+
+    def __init__(self, app: App):
+        self._app = app
+        self._q: queue.Queue[tuple[str, str, dict]] = queue.Queue()
+        # Maps channel → Unix timestamp of the last successful send.
+        self._last_send: dict[str, float] = {}
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, daemon=True, name="mq-sender")
+        self._thread.start()
+        log.info("MessageQueue  started")
+
+    def enqueue(self, channel: str, text: str, **kwargs) -> None:
+        self._q.put((channel, text, kwargs))
+
+    def _run(self) -> None:
+        while True:
+            try:
+                channel, text, kwargs = self._q.get(timeout=1)
+            except queue.Empty:
+                continue
+
+            self._throttle(channel)
+            self._send_with_retry(channel, text, kwargs)
+            self._q.task_done()
+
+    def _throttle(self, channel: str) -> None:
+        with self._lock:
+            last = self._last_send.get(channel, 0.0)
+        wait = 1.0 - (time.monotonic() - last)
+        if wait > 0:
+            time.sleep(wait)
+
+    def _send_with_retry(self, channel: str, text: str, kwargs: dict) -> None:
+        while True:
+            try:
+                self._app.client.chat_postMessage(
+                    channel=channel,
+                    text=text,
+                    unfurl_links=False,
+                    unfurl_media=False,
+                    **kwargs,
+                )
+                with self._lock:
+                    self._last_send[channel] = time.monotonic()
+                return
+            except SlackApiError as exc:
+                if exc.response.status_code == 429:
+                    retry_after = int(exc.response.headers.get("Retry-After", "5"))
+                    log.warning(
+                        "MQ  429 rate-limited  channel=%s  retry_after=%ds",
+                        channel, retry_after,
+                    )
+                    time.sleep(retry_after)
+                    # Re-throttle per-channel timer after sleeping
+                    with self._lock:
+                        self._last_send[channel] = time.monotonic()
+                else:
+                    log.exception("MQ  send-fail  channel=%s", channel)
+                    return
+            except Exception:
+                log.exception("MQ  send-fail  channel=%s", channel)
+                return
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _paper_link(paper: Paper) -> str:
-    """Return a Slack ``<url|id>`` hyperlink for a Paper.
-
-    Prefers the wg21.link short URL stored in ``paper.url``, falls back to
-    ``paper.long_link``, then to a synthesised ``https://wg21.link/{id}`` URL.
-    """
     url = paper.url or paper.long_link
     if not url:
         url = f"https://wg21.link/{paper.id}"
@@ -38,13 +114,11 @@ def _paper_link(paper: Paper) -> str:
 
 
 def _hit_label(hit_url: str, prefix: str, number: int, revision: int, ext: str) -> str:
-    """Return a Slack ``<url|filename>`` link for a probe hit URL."""
     name = f"{prefix}{number:04d}R{revision}{ext}"
     return f"<{hit_url}|{name}>"
 
 
 def _fmt_lm(lm: datetime | None) -> str:
-    """Format Last-Modified as a compact human-readable age string."""
     if lm is None:
         return "modified: unknown"
     now = datetime.now(timezone.utc)
@@ -58,76 +132,20 @@ def _fmt_lm(lm: datetime | None) -> str:
     return f"modified {lm.strftime('%Y-%m-%d')}"
 
 
-# ── Notification logic ────────────────────────────────────────────────────────
+# ── Channel notification ──────────────────────────────────────────────────────
 
-def _is_watchlist_related(
-    paper_number: int | None,
-    author: str | None,
-    watchlist_paper_nums: set[int],
-    watched_authors: list[str],
-) -> bool:
-    if paper_number is not None and paper_number in watchlist_paper_nums:
-        return True
-    if author and any(a in author.lower() for a in watched_authors):
-        return True
-    return False
-
-
-def notify_channel(app: App, result: PollResult, watchlist: Watchlist | None = None) -> None:
+def notify_channel(app: App, result: PollResult, mq: MessageQueue) -> None:
+    """Post batch/non-watchlist events to the configured notification channel."""
     channel = settings.notification_channel
     if not channel:
         return
 
-    watched_authors = watchlist.authors if watchlist else []
-    watchlist_paper_nums = set(settings.watchlist_papers)
     lines: list[str] = []
 
-    # ── 1. Individual: new P-paper by a watched author (wg21.link index) ─────
-    if settings.notify_on_watchlist_author and result.watchlist_matches:
-        lines.append("*:rotating_light: Watched author — new publication:*")
-        for paper in result.watchlist_matches:
-            p_link = _paper_link(paper)
-            lines.append(f"• {p_link} — {paper.title} (by *{paper.author}*)")
-
-    # ── 2. Individual: watched author found in draft front-text ───────────────
-    if settings.notify_on_watchlist_author and result.probe_watchlist_hits:
-        lines.append("*:rotating_light: Watched author — new draft:*")
-        for hit in result.probe_watchlist_hits:
-            matched = [a for a in watched_authors if a in (hit.front_text or "").lower()]
-            names = ", ".join(f"*{a}*" for a in matched) if matched else "*watchlist author*"
-            h_link = _hit_label(hit.url, hit.prefix, hit.number, hit.revision, hit.extension)
-            lm = _fmt_lm(hit.last_modified)
-            lines.append(f"• {h_link} — mentions {names} — {lm}")
-
-    # ── 3. Individual: watchlist-number probe hit ─────────────────────────────
-    wl_hit_ids = {id(h) for h in result.probe_watchlist_hits}
-    wl_probe   = [h for h in result.probe_hits if h.tier == "watchlist"
-                  and id(h) not in wl_hit_ids]
-    batch_probe = [h for h in result.probe_hits if h.tier != "watchlist"
-                   and id(h) not in wl_hit_ids]
-
-    if settings.notify_on_watchlist_paper and wl_probe:
-        lines.append("*:rotating_light: Watched paper — new draft:*")
-        for hit in wl_probe:
-            h_link = _hit_label(hit.url, hit.prefix, hit.number, hit.revision, hit.extension)
-            lm = _fmt_lm(hit.last_modified)
-            lines.append(f"• {h_link} — {lm}")
-
-    # ── 4a. Individual: D→P transition for watched paper / author ─────────────
-    # ── 4b. Batch:      D→P transition for everything else ────────────────────
-    dp_wl, dp_batch = [], []
-    for tr in result.dp_transitions:
-        if _is_watchlist_related(
-            tr.paper.number, tr.paper.author,
-            watchlist_paper_nums, watched_authors,
-        ):
-            dp_wl.append(tr)
-        else:
-            dp_batch.append(tr)
-
-    if settings.notify_on_dp_transition and dp_wl:
-        lines.append("*:white_check_mark: Watched paper published (D→P):*")
-        for tr in dp_wl:
+    # D→P transitions (all in one batch — watchlist-related ones also go to DMs)
+    if settings.notify_on_dp_transition and result.dp_transitions:
+        lines.append(f"*:books: {len(result.dp_transitions)} draft(s) now published:*")
+        for tr in result.dp_transitions:
             p_link = _paper_link(tr.paper)
             d_link = f"<{tr.draft_url}|draft>"
             disc_str = (
@@ -139,23 +157,14 @@ def notify_channel(app: App, result: PollResult, watchlist: Watchlist | None = N
                 if tr.last_modified else None
             )
             lines.append(
-                f"• {p_link} — {tr.paper.title} (by *{tr.paper.author}*)"
-                f" — {d_link} (draft seen {disc_str}, {lm_str})"
-            )
-
-    if settings.notify_on_dp_transition and dp_batch:
-        lines.append(f"*:books: {len(dp_batch)} draft(s) now published:*")
-        for tr in dp_batch:
-            p_link = _paper_link(tr.paper)
-            d_link = f"<{tr.draft_url}|draft>"
-            lines.append(
                 f"• {p_link} — {tr.paper.title}"
                 f" (by {tr.paper.author}) — {d_link}"
+                f" (draft seen {disc_str}, {lm_str})"
             )
 
-    # ── 5a. Batch: frontier probe hits ────────────────────────────────────────
-    frontier_hits = [h for h in batch_probe if h.tier == "frontier"]
-    other_hits    = [h for h in batch_probe if h.tier not in ("frontier",)]
+    # Frontier probe hits
+    frontier_hits = [h for h in result.probe_hits if h.tier == "frontier"]
+    other_hits    = [h for h in result.probe_hits if h.tier != "frontier"]
 
     if settings.notify_on_frontier_hit and frontier_hits:
         lines.append(f"*:mag: {len(frontier_hits)} new frontier draft(s):*")
@@ -164,7 +173,6 @@ def notify_channel(app: App, result: PollResult, watchlist: Watchlist | None = N
             lm = _fmt_lm(hit.last_modified)
             lines.append(f"• {h_link} — {lm}")
 
-    # ── 5b. Batch: other probe hits (recent / cold) ───────────────────────────
     if settings.notify_on_any_draft and other_hits:
         lines.append(f"*:mag: {len(other_hits)} new draft(s) discovered:*")
         for hit in other_hits:
@@ -177,20 +185,49 @@ def notify_channel(app: App, result: PollResult, watchlist: Watchlist | None = N
 
     batches = _batch_lines(lines, SLACK_MAX_TEXT)
     log.info(
-        "NOTIFY  channel=%s  messages=%d  "
-        "watchlist=%d  probe-wl=%d  dp-wl=%d  dp-batch=%d  "
-        "frontier=%d  other=%d",
+        "NOTIFY  channel=%s  messages=%d  dp=%d  frontier=%d  other=%d",
         channel, len(batches),
-        len(result.watchlist_matches),
-        len(result.probe_watchlist_hits),
-        len(dp_wl), len(dp_batch),
-        len(frontier_hits), len(other_hits),
+        len(result.dp_transitions), len(frontier_hits), len(other_hits),
     )
     for batch in batches:
-        try:
-            app.client.chat_postMessage(channel=channel, text=batch)
-        except Exception:
-            log.exception("NOTIFY-FAIL  channel=%s", channel)
+        mq.enqueue(channel, batch)
+
+
+# ── Per-user DM notifications ─────────────────────────────────────────────────
+
+def notify_users(app: App, result: PollResult, mq: MessageQueue) -> None:
+    """Send DMs to users whose watchlist matched new papers or probe hits."""
+    if not result.per_user_matches:
+        return
+
+    for user_id, matches in result.per_user_matches.items():
+        lines: list[str] = []
+
+        if matches.papers:
+            lines.append("*:rotating_light: Papers matching your watchlist:*")
+            for paper, reason in matches.papers:
+                p_link = _paper_link(paper)
+                tag = f"[{reason} match]"
+                lines.append(f"• {p_link} — {paper.title} (by *{paper.author}*) {tag}")
+
+        if matches.probe_hits:
+            lines.append("*:rotating_light: New drafts matching your watchlist:*")
+            for hit, reason in matches.probe_hits:
+                h_link = _hit_label(hit.url, hit.prefix, hit.number, hit.revision, hit.extension)
+                lm = _fmt_lm(hit.last_modified)
+                tag = f"[{reason} match]"
+                lines.append(f"• {h_link} — {lm} {tag}")
+
+        if not lines:
+            continue
+
+        batches = _batch_lines(lines, SLACK_MAX_TEXT)
+        log.info(
+            "NOTIFY-USER  user=%s  messages=%d  papers=%d  hits=%d",
+            user_id, len(batches), len(matches.papers), len(matches.probe_hits),
+        )
+        for batch in batches:
+            mq.enqueue(user_id, batch)
 
 
 def _batch_lines(lines: list[str], max_len: int) -> list[str]:
@@ -210,26 +247,53 @@ def _batch_lines(lines: list[str], max_len: int) -> list[str]:
     return batches
 
 
+# ── Command handlers ──────────────────────────────────────────────────────────
+
 def register_handlers(
     app: App,
-    watchlist: Watchlist,
+    user_watchlist: UserWatchlist,
     state: ProbeState,
     paper_count_fn,
 ) -> None:
 
-    def _dispatch(text: str, say, reply_opts: dict) -> None:
+    def _dispatch(text: str, user_id: str, channel_type: str, say, reply_opts: dict) -> None:
         words = [w for w in text.split() if w]
         if not words:
             return
         cmd = words[0].lower()
         if cmd == "watchlist":
-            _handle_watchlist(words[1:], watchlist, say, reply_opts)
+            _route_watchlist(words[1:], user_id, channel_type, say, reply_opts)
         elif cmd == "status":
             _handle_status(state, paper_count_fn, say, reply_opts)
         elif cmd == "help":
-            say(text="Commands: `watchlist add|remove|list [name]`, `status`", **reply_opts)
+            say(
+                text=(
+                    "Commands:\n"
+                    "• `watchlist add|remove|list [name-or-paper-number]` — "
+                    "manage your personal watchlist (DM only)\n"
+                    "• `status` — show bot status\n"
+                    "• `help` — this message"
+                ),
+                **reply_opts,
+            )
         else:
             say(text="Unknown command. Try `help` for usage.", **reply_opts)
+
+    def _route_watchlist(
+        args: list[str],
+        user_id: str,
+        channel_type: str,
+        say,
+        reply_opts: dict,
+    ) -> None:
+        if channel_type == "im":
+            _handle_watchlist(args, user_id, user_watchlist, say, reply_opts)
+        elif channel_type == "mpim":
+            say(
+                text="Watchlist commands only work in a 1:1 DM with me.",
+                **reply_opts,
+            )
+        # For public/private channels: silently ignore
 
     @app.event("app_mention")
     def handle_app_mention(event, context, say):
@@ -239,8 +303,12 @@ def register_handlers(
         bot_id = context.get("bot_user_id", "")
         if bot_id and f"<@{bot_id}>" in text:
             text = text.split(f"<@{bot_id}>", 1)[-1].strip()
+        if not text:
+            return
+        user_id = event.get("user", "")
+        channel_type = event.get("channel_type", "channel")
         log.debug("app_mention handler firing, ts=%s", event.get("ts"))
-        _dispatch(text, say=say, reply_opts=_reply_opts(event))
+        _dispatch(text, user_id, channel_type, say=say, reply_opts=_reply_opts(event))
 
     @app.event("message")
     def handle_message(event, context, say):
@@ -250,14 +318,25 @@ def register_handlers(
         if not text:
             return
         bot_id = context.get("bot_user_id", "")
-        is_dm = event.get("channel_type") == "im"
+        channel_type = event.get("channel_type", "")
+        user_id = event.get("user", "")
 
-        if is_dm:
+        if channel_type == "im":
+            # Strip bot mention if present (e.g. user typed @bot watchlist ...)
             if bot_id and f"<@{bot_id}>" in text:
                 text = text.split(f"<@{bot_id}>", 1)[-1].strip()
             if text:
-                _dispatch(text, say=say, reply_opts=_reply_opts(event))
+                _dispatch(text, user_id, channel_type, say=say, reply_opts=_reply_opts(event))
+
+        elif channel_type == "mpim":
+            # Only respond if the bot is mentioned
+            if bot_id and f"<@{bot_id}>" in text:
+                text = text.split(f"<@{bot_id}>", 1)[-1].strip()
+                if text:
+                    _dispatch(text, user_id, channel_type, say=say, reply_opts=_reply_opts(event))
+
         else:
+            # Public/private channels: handled by app_mention; skip plain messages
             if bot_id and f"<@{bot_id}>" in text:
                 return
 
@@ -270,34 +349,60 @@ def _reply_opts(event: dict) -> dict:
     return opts
 
 
-def _handle_watchlist(args: list[str], watchlist: Watchlist, say, reply_opts: dict) -> None:
+def _handle_watchlist(
+    args: list[str],
+    user_id: str,
+    user_watchlist: UserWatchlist,
+    say,
+    reply_opts: dict,
+) -> None:
     if not args:
-        _show_watchlist(watchlist, say, reply_opts)
+        _show_watchlist(user_id, user_watchlist, say, reply_opts)
         return
     action = args[0].lower()
-    name = " ".join(args[1:]).strip()
-    if action == "add" and name:
-        if watchlist.add_author(name):
-            say(text=f"Added *{name}* to the watchlist.", **reply_opts)
+    raw = " ".join(args[1:]).strip()
+
+    if action == "add" and raw:
+        if user_watchlist.add(user_id, raw):
+            etype = "paper number" if raw.strip().isdigit() else "author"
+            say(text=f"Added *{raw}* ({etype}) to your watchlist.", **reply_opts)
         else:
-            say(text=f"*{name}* is already on the watchlist.", **reply_opts)
-    elif action == "remove" and name:
-        if watchlist.remove_author(name):
-            say(text=f"Removed *{name}* from the watchlist.", **reply_opts)
+            say(text=f"*{raw}* is already on your watchlist.", **reply_opts)
+    elif action == "remove" and raw:
+        if user_watchlist.remove(user_id, raw):
+            say(text=f"Removed *{raw}* from your watchlist.", **reply_opts)
         else:
-            say(text=f"*{name}* was not on the watchlist.", **reply_opts)
+            say(text=f"*{raw}* was not on your watchlist.", **reply_opts)
     elif action == "list":
-        _show_watchlist(watchlist, say, reply_opts)
+        _show_watchlist(user_id, user_watchlist, say, reply_opts)
     else:
-        say(text="Usage: `watchlist add|remove|list [name]`", **reply_opts)
+        say(
+            text="Usage: `watchlist add|remove|list [name-or-paper-number]`",
+            **reply_opts,
+        )
 
 
-def _show_watchlist(watchlist: Watchlist, say, reply_opts: dict) -> None:
-    authors = watchlist.authors
-    if authors:
-        say(text="Watched authors:\n" + "\n".join(f"• {a}" for a in authors), **reply_opts)
+def _show_watchlist(
+    user_id: str,
+    user_watchlist: UserWatchlist,
+    say,
+    reply_opts: dict,
+) -> None:
+    entries = user_watchlist.list_entries(user_id)
+    if entries:
+        lines = [f"• {entry} ({etype})" for entry, etype in entries]
+        say(
+            text="Your watchlist:\n" + "\n".join(lines),
+            **reply_opts,
+        )
     else:
-        say(text="Watchlist is empty. Use `watchlist add <name>` to add an author.", **reply_opts)
+        say(
+            text=(
+                "Your watchlist is empty.\n"
+                "Use `watchlist add <author-name>` or `watchlist add <paper-number>` to add entries."
+            ),
+            **reply_opts,
+        )
 
 
 def _handle_status(state: ProbeState, paper_count_fn, say, reply_opts: dict) -> None:

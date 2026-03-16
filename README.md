@@ -8,10 +8,12 @@ A Python project that probes the isocpp.org paper system for unpublished D-paper
 
 ## Features
 
-- **Author watchlist** -- `watchlist add Dietmar` notifies when watched authors publish
+- **Per-user watchlists** -- each user manages their own list of authors and paper numbers via DM; the bot sends a personal DM when a match is found
 - **ISO draft probing** -- Three-tier async HEAD requests to `isocpp.org/files/papers/` detect unpublished D-papers
 - **Frontier monitoring** -- Automatically probes newly assigned paper numbers beyond the current highest
 - **30-minute polling** -- Fetches wg21.link/index.json every 30 minutes (configurable)
+- **Rate-limited posting** -- All Slack messages are queued through a background thread that enforces 1 msg/sec per channel and respects HTTP 429 `Retry-After`
+- **PostgreSQL storage** -- All state (probe history, index cache, watchlists) lives in Postgres; logs stay as rotating files
 - **Status command** -- `status` shows papers loaded, last poll time, and probe stats
 
 ## Slack App Setup
@@ -28,14 +30,18 @@ Go to **OAuth & Permissions** in the left sidebar. Under **Bot Token Scopes**, a
 
 | Scope | Why |
 |-------|-----|
-| `chat:write` | Post messages to channels (watchlist notifications) |
+| `chat:write` | Post messages to channels and send DMs |
 | `chat:write.public` | Post to public channels the bot hasn't been invited to |
-| `im:history` | Read DM messages sent to the bot |
-| `im:write` | Reply to DMs |
+| `im:history` | Read messages in 1:1 DMs with the bot |
+| `im:write` | Open 1:1 DM conversations to deliver watchlist alerts |
+| `mpim:history` | Read messages in group DMs the bot has been invited to |
+| `mpim:write` | Reply in group DMs |
 | `channels:history` | Read messages in public channels |
 | `groups:history` | Read messages in private channels the bot is invited to |
 | `groups:write` | Reply in private channels |
 | `app_mentions:read` | Respond when someone `@paperbot`s |
+
+> **Note on group DMs (`mpim`):** When the bot is invited to a group DM, `watchlist` commands are rejected with a friendly error telling the user to use a 1:1 DM instead. `status` and `help` work normally. The `mpim:history` and `mpim:write` scopes are needed to receive and reply to those messages.
 
 ### 3. Enable Events
 
@@ -45,7 +51,8 @@ Go to **Event Subscriptions** in the left sidebar:
 2. Under **Subscribe to bot events**, add:
    - `message.channels` (messages in public channels)
    - `message.groups` (messages in private channels)
-   - `message.im` (direct messages)
+   - `message.im` (1:1 direct messages)
+   - `message.mpim` (group direct messages)
    - `app_mention` (when someone @mentions the bot)
 3. You will set the **Request URL** after the bot is running (step 7)
 
@@ -78,21 +85,16 @@ SLACK_SIGNING_SECRET=<your signing secret from step 5>
 SLACK_BOT_TOKEN=xoxb-<your bot token from step 5>
 PORT=3000
 
-# Slack channel ID for notifications.
+# PostgreSQL connection string (required)
+DATABASE_URL=postgresql://user:password@localhost:5432/paperbot
+
+# Slack channel ID for general notifications (new frontier drafts, D→P transitions).
 # To find it: open the channel in Slack, click the channel name
-# at the top, scroll to the bottom of the popup -- the ID
-# looks like C0123456789
+# at the top, scroll to the bottom of the popup -- the ID looks like C0123456789
 NOTIFICATION_CHANNEL=C0123456789
 
-# Authors to watch (case-insensitive substring match)
-WATCHLIST_AUTHORS=["Dietmar", "Niebler", "Baker"]
-
-# Specific paper numbers to monitor with full probing
-WATCHLIST_PAPERS=[2300, 3482]
-
-# Explicit number ranges to probe
+# Explicit number ranges to always probe as hot (optional)
 FRONTIER_EXPLICIT_RANGES=[{"min": 4033, "max": 4042}, {"min": 4049, "max": 4080}]
-```
 
 Install and run:
 
@@ -119,17 +121,20 @@ ngrok http 3000
 
 ### 8. Invite the Bot
 
-- **Public channel notifications:** The bot can post to any public channel automatically (via `chat:write.public`). Set `NOTIFICATION_CHANNEL` to that channel's ID.
-- **Private channels:** Type `/invite @paperbot` in the private channel.
-- **DMs:** Open a DM with `paperbot` from your Slack sidebar.
+- **Public channel notifications:** The bot posts to `NOTIFICATION_CHANNEL` automatically (via `chat:write.public`). No invite needed.
+- **Private channels:** Type `/invite @paperbot` in the private channel for `@mention` support.
+- **Watchlist DMs (required):** Each user must open a 1:1 DM with `paperbot` to manage their personal watchlist. The bot will also DM users proactively when their watchlist matches a new paper.
+- **Group DMs:** The bot can be invited, but `watchlist` commands will be rejected with a message directing the user to use a 1:1 DM.
 
 ### 9. Verify It Works
 
-1. DM the bot: `status` -- should reply with papers loaded, last poll time, and probe stats
-2. DM the bot: `watchlist add Niebler` -- should confirm the author was added
-3. DM the bot: `watchlist list` -- should show the current watchlist
-4. Type `@paperbot status` in a channel -- should reply in-thread
-5. Check your notification channel after 30 minutes -- any new papers matching your watchlist will appear there
+1. DM the bot: `status` — should reply with papers loaded, last poll time, and probe stats
+2. DM the bot: `watchlist add Niebler` — should confirm the author was added (as an **author** entry)
+3. DM the bot: `watchlist add 2300` — should confirm the paper was added (as a **paper number** entry)
+4. DM the bot: `watchlist list` — should show both entries with their types
+5. DM the bot: `watchlist remove Niebler` — should confirm removal
+6. Type `@paperbot status` in a channel — should reply in-thread
+7. Check your notification channel after 30 minutes — frontier hits and D→P transitions appear there; personal watchlist matches arrive as DMs
 
 ### Production Deployment
 
@@ -143,16 +148,23 @@ The existing Node.js paperbot uses Ansible for deployment ([ansible-paperbot](ht
 
 ## Bot Commands
 
-All commands work via DM or `@paperbot <command>` in a channel.
+Watchlist commands only work in a **1:1 DM** with the bot (each user has their own independent watchlist). `status` and `help` work everywhere — DMs, group DMs, and channels via `@paperbot`.
 
-| Command | Description |
-|---------|-------------|
-| `watchlist` | Show current watched authors |
-| `watchlist list` | Show current watched authors |
-| `watchlist add <name>` | Add an author to the watchlist |
-| `watchlist remove <name>` | Remove an author from the watchlist |
-| `status` | Show papers loaded, last poll time, probe stats |
-| `help` | Show command summary |
+| Command | Where | Description |
+|---------|-------|-------------|
+| `watchlist` | DM only | Show your personal watchlist |
+| `watchlist list` | DM only | Show your personal watchlist |
+| `watchlist add <name-or-number>` | DM only | Add an author name substring *or* paper number — type is auto-detected |
+| `watchlist remove <name-or-number>` | DM only | Remove an entry from your watchlist |
+| `status` | Anywhere | Show papers loaded, last poll time, probe stats |
+| `help` | Anywhere | Show command summary |
+
+### Watchlist matching
+
+- **Author entries** (`watchlist add Niebler`) — match when the author field of a new index paper contains the substring (case-insensitive), or when the first ~1,000 words of a newly discovered draft mention the name.
+- **Paper number entries** (`watchlist add 2300`) — match when a draft for that number is newly discovered, or when the paper appears in the wg21.link index.
+
+When a match is found, all hits for that user are batched and sent as a single DM.
 
 ## Environment Variables
 
@@ -164,6 +176,7 @@ All parameters are configurable via environment variables or a `.env` file. See 
 |----------|-------------|
 | `SLACK_SIGNING_SECRET` | Slack app signing secret |
 | `SLACK_BOT_TOKEN` | Slack bot token (`xoxb-...`) |
+| `DATABASE_URL` | PostgreSQL connection string (`postgresql://user:pass@host:5432/db`) |
 
 ### Scheduling
 
@@ -181,19 +194,12 @@ All parameters are configurable via environment variables or a `.env` file. See 
 | `PROBE_PREFIXES` | `["D","P"]` | Prefixes for gap/unknown numbers |
 | `PROBE_EXTENSIONS` | `[".pdf",".html"]` | File extensions to check |
 
-### Watchlist
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `WATCHLIST_PAPERS` | `[]` | Paper numbers probed every cycle (e.g. `[2300, 3482]`) |
-| `WATCHLIST_AUTHORS` | `[]` | Author substrings for notifications (e.g. `["Dietmar", "Niebler"]`) |
-
 ### Frontier
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `FRONTIER_WINDOW_ABOVE` | `30` | Numbers above effective frontier to probe every cycle |
-| `FRONTIER_WINDOW_BELOW` | `5` | Numbers below effective frontier to probe every cycle |
+| `FRONTIER_WINDOW_ABOVE` | `60` | Numbers above effective frontier to probe every cycle |
+| `FRONTIER_WINDOW_BELOW` | `30` | Numbers below effective frontier to probe every cycle |
 | `FRONTIER_EXPLICIT_RANGES` | `[]` | Additional explicit ranges, e.g. `[{"min":4033,"max":4060}]` |
 | `FRONTIER_GAP_THRESHOLD` | `50` | Max gap between consecutive P-numbers before treating a number as an outlier (prevents pre-assigned far-future numbers like P5000 from shifting the frontier) |
 
@@ -230,17 +236,19 @@ All parameters are configurable via environment variables or a `.env` file. See 
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `NOTIFICATION_CHANNEL` | `""` | Slack channel ID for alerts (empty = disabled) |
-| `NOTIFY_ON_WATCHLIST_AUTHOR` | `true` | Notify on watched author match in index |
-| `NOTIFY_ON_WATCHLIST_PAPER` | `true` | Notify on recently modified draft for a watchlist paper |
+| `NOTIFICATION_CHANNEL` | `""` | Slack channel ID for general alerts (frontier hits, D→P transitions); empty = disabled |
 | `NOTIFY_ON_FRONTIER_HIT` | `true` | Notify on recently modified draft near the frontier |
 | `NOTIFY_ON_ANY_DRAFT` | `true` | Notify on any other recently modified draft |
+| `NOTIFY_ON_DP_TRANSITION` | `true` | Notify when a tracked D-paper appears in the index as its published P counterpart |
+
+> Personal watchlist matches (author or paper number) are always sent as a DM to the matching user — they are not posted to `NOTIFICATION_CHANNEL`.
 
 ### Storage
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DATA_DIR` | `./data` | Directory for cache and state files |
+| `DATABASE_URL` | `""` | PostgreSQL DSN — required |
+| `DATA_DIR` | `./data` | Directory for log files |
 | `CACHE_TTL_HOURS` | `1` | How long the wg21.link index cache is considered fresh |
 
 ## Architecture
@@ -251,13 +259,26 @@ paperbot-python/
     __main__.py     Entry point; wires together all components
     config.py       All settings via pydantic-settings
     models.py       Paper dataclass, PaperPrefix/PaperType/FileExt enums
-    sources.py      WG21Index, ISOProber, open-std.org scraper
-    monitor.py      Scheduler, diff engine, Watchlist, PollResult
-    bot.py          Slack Bolt app, message handlers, notify_channel
-    storage.py      JsonCache (TTL + atomic writes), ProbeState
-  data/             Runtime cache and state (gitignored)
+    sources.py      WG21Index (PaperCache-backed), ISOProber, open-std.org scraper
+    monitor.py      Scheduler, diff engine, PerUserMatches, PollResult
+    bot.py          Slack Bolt app, MessageQueue, notify_channel, notify_users
+    storage.py      PaperCache, ProbeState, UserWatchlist (all PostgreSQL-backed)
+    db.py           ThreadedConnectionPool init and schema DDL
+  data/             Log files (gitignored); all other state lives in PostgreSQL
   tests/
+  migrate.py        One-shot migration from legacy JSON files to PostgreSQL
+  migrate.sql       SQL-only migration script (alternative)
 ```
+
+### PostgreSQL Schema
+
+| Table | Purpose |
+|-------|---------|
+| `paper_cache` | TTL-cached wg21.link index JSON blob |
+| `discovered_urls` | All URLs seen by the ISO prober with timestamps |
+| `probe_miss_counts` | Exponential backoff counters per paper number |
+| `poll_state` | Last-poll timestamp (singleton row) |
+| `user_watchlist` | Per-user author/paper entries with type discrimination |
 
 ### Two-Frequency Probing Strategy
 
@@ -265,7 +286,7 @@ Every P-number from 1 to the effective frontier is probed. Numbers are divided i
 
 | Frequency | What | Condition | Per-cycle URLs |
 |-----------|------|-----------|----------------|
-| **Hot** (every cycle) | Watchlist papers | `WATCHLIST_PAPERS` list | D-prefix, latest+1..+2, pdf+html |
+| **Hot** (every cycle) | Watchlist papers | union of all users' watched paper numbers | D-prefix, latest+1..+2, pdf+html |
 | **Hot** (every cycle) | Frontier numbers | ±window around effective frontier | D+P, R0..R1 for unknowns; D, latest+1..+2 for known |
 | **Hot** (every cycle) | Recently active papers | date within `HOT_LOOKBACK_MONTHS` | D-prefix, latest+1..+2, pdf+html |
 | **Cold** (1/48 per cycle ≈ daily) | All other P-numbers | everything else | D-prefix, latest+1, pdf+html |
@@ -293,10 +314,11 @@ The `Last-Modified` timestamp is shown in every notification message.
 
 ## Dependencies
 
-- `slack-bolt` -- Slack app framework
-- `httpx[http2]` -- Async HTTP with HTTP/2 support
-- `pydantic-settings` -- Type-safe configuration
-- `apscheduler>=4.0.0a,<5` -- Async job scheduling
+- `slack-bolt` — Slack app framework
+- `httpx[http2]` — Async HTTP with HTTP/2 support
+- `pydantic-settings` — Type-safe configuration
+- `apscheduler>=4.0.0a,<5` — Async job scheduling
+- `psycopg2-binary` — PostgreSQL adapter (sync, thread-safe)
 
 ## Development
 
