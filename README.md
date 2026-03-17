@@ -1,6 +1,7 @@
 # paperbot-python
 
 [![CI](https://github.com/CppDigest/paperbot-python/actions/workflows/ci.yml/badge.svg)](https://github.com/CppDigest/paperbot-python/actions/workflows/ci.yml)
+[![CD](https://github.com/CppDigest/paperbot-python/actions/workflows/cd.yml/badge.svg)](https://github.com/CppDigest/paperbot-python/actions/workflows/cd.yml)
 
 WG21 C++ paper tracker with ISO draft probing and Slack notifications.
 
@@ -138,13 +139,26 @@ ngrok http 3000
 
 ### Production Deployment
 
-For a persistent deployment (the bot needs to stay running 24/7 to poll every 30 minutes):
+The bot runs as a Docker container deployed via CD on every push to `main`. It connects to the host's shared PostgreSQL and sits behind nginx (TLS on `:443`).
 
-- **Systemd service** on a Linux server
-- **Docker container**
-- **Cloud VM** (any small instance works -- the bot uses minimal resources)
+```
+Push to main → CI tests → SSH into server → git pull → docker compose up --build → Health check
+```
 
-The existing Node.js paperbot uses Ansible for deployment ([ansible-paperbot](https://github.com/cppalliance/ansible-paperbot)). A similar approach works for the Python version.
+Quick start on a fresh server:
+
+```bash
+# On the server (after Docker, PostgreSQL, and nginx are set up)
+git clone https://github.com/CppDigest/paperbot-python.git /opt/paperbot
+cd /opt/paperbot
+cp .env.example .env        # edit with real credentials
+docker compose up -d --build
+curl -sf http://localhost:9101/health
+```
+
+See [`deploy/SERVER_SETUP.md`](deploy/SERVER_SETUP.md) for the full Ubuntu 22.04 provisioning guide, and [`.github/workflows/cd.yml`](.github/workflows/cd.yml) for the CD pipeline.
+
+Database backups run daily via [`.github/workflows/db-backup.yml`](.github/workflows/db-backup.yml), uploading `pg_dump` snapshots to Cloudflare R2.
 
 ## Bot Commands
 
@@ -264,10 +278,19 @@ paperbot-python/
     bot.py          Slack Bolt app, MessageQueue, notify_channel, notify_users
     storage.py      PaperCache, ProbeState, UserWatchlist (all PostgreSQL-backed)
     db.py           ThreadedConnectionPool init and schema DDL
+    health.py       HTTP health-check endpoint (GET /health on port 8080)
   data/             Log files (gitignored); all other state lives in PostgreSQL
+  deploy/
+    nginx/
+      paperbot.conf Reference nginx site config (443 → 3000, /health → 8080)
+    SERVER_SETUP.md Full Ubuntu 22.04 server provisioning guide
   tests/
-  migrate.py        One-shot migration from legacy JSON files to PostgreSQL
-  migrate.sql       SQL-only migration script (alternative)
+  Dockerfile        Multi-stage build (python:3.12-slim)
+  docker-compose.yml  Single-service compose (builds locally, connects to host PostgreSQL)
+  .github/workflows/
+    ci.yml          Test matrix on push/PR to main
+    cd.yml          SSH deploy (git pull + build) on push to main
+    db-backup.yml   Daily pg_dump to Cloudflare R2
 ```
 
 ### PostgreSQL Schema
@@ -371,3 +394,23 @@ The `.github/workflows/ci.yml` workflow runs automatically on every push and pul
 - **Artefact**: the `coverage.xml` report from the Python 3.12 run is uploaded and kept for 7 days
 
 Coverage details are visible in the **Summary** tab of each workflow run (rendered as a Markdown table by `coverage report --format=markdown`).
+
+### Continuous Deployment
+
+The `.github/workflows/cd.yml` workflow runs on every push to `main`:
+
+1. **Test** — single Python 3.12 pytest run as a gate
+2. **Deploy** — SSHes into the server, runs `git pull`, and rebuilds the container with `docker compose up -d --build`
+3. **Health check** — verifies `GET /health` returns 200
+
+The app container connects to the host's shared PostgreSQL via `host.docker.internal`. Restarting the container has no effect on the database.
+
+### Database Backups
+
+The `.github/workflows/db-backup.yml` workflow runs daily at 3 AM UTC (and supports manual dispatch):
+
+1. SSHes into the server and runs `pg_dump` on the host's PostgreSQL
+2. Uploads the dump to Cloudflare R2 (S3-compatible, private, zero egress fees)
+3. Prunes backups older than 30 days
+
+Required GitHub Secrets for CD and backups are documented in [`deploy/SERVER_SETUP.md`](deploy/SERVER_SETUP.md#9-github-secrets-checklist).

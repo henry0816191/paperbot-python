@@ -1,0 +1,12 @@
+services:
+  paperbot:
+    build: .
+    ports:
+      - "127.0.0.1:9100:3000"
+      - "127.0.0.1:9101:8080"
+    env_file: .env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
