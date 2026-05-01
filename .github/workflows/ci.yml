@@ -30,7 +30,7 @@ jobs:
       - name: Run tests with coverage
         run: |
           python -m pytest tests/ \
-            --cov=paperbot \
+            --cov=paperscout \
             --cov-report=term-missing \
             --cov-report=xml \
             --cov-fail-under=90 \

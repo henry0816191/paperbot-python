@@ -1,5 +1,5 @@
 services:
-  paperbot:
+  paperscout:
     build: .
     ports:
       - "127.0.0.1:9100:3000"

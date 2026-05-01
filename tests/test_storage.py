@@ -1,4 +1,4 @@
-"""Tests for paperbot.storage (PostgreSQL-backed via FakePool)."""
+"""Tests for paperscout.storage (PostgreSQL-backed via FakePool)."""
 from __future__ import annotations
 
 import time
@@ -6,8 +6,8 @@ from unittest.mock import patch
 
 import pytest
 
-from paperbot.models import Paper
-from paperbot.storage import (
+from paperscout.models import Paper
+from paperscout.storage import (
     PaperCache,
     ProbeState,
     UserWatchlist,
@@ -36,7 +36,7 @@ class TestPaperCache:
     def test_is_stale_when_old(self, fake_pool):
         cache = PaperCache(fake_pool, ttl_hours=1.0)
         cache.write({"x": 1})
-        with patch("paperbot.storage.time") as mock_time:
+        with patch("paperscout.storage.time") as mock_time:
             mock_time.time.return_value = 1e12
             assert not cache.is_fresh()
 
@@ -58,7 +58,7 @@ class TestPaperCache:
     def test_read_if_fresh_returns_none_when_stale(self, fake_pool):
         cache = PaperCache(fake_pool, ttl_hours=1.0)
         cache.write({"a": 1})
-        with patch("paperbot.storage.time") as mock_time:
+        with patch("paperscout.storage.time") as mock_time:
             mock_time.time.return_value = 1e12
             assert cache.read_if_fresh() is None
 
@@ -297,7 +297,7 @@ class TestUserWatchlist:
         assert nums == {2300, 2301}
 
     def test_matches_for_users_author_match(self, fake_pool):
-        from paperbot.monitor import PerUserMatches
+        from paperscout.monitor import PerUserMatches
         wl = UserWatchlist(fake_pool)
         wl.add("U1", "niebler")
         paper = Paper(id="P2300R11", title="X", author="Eric Niebler")
@@ -307,7 +307,7 @@ class TestUserWatchlist:
         assert paper in matched_papers
 
     def test_matches_for_users_paper_match(self, fake_pool):
-        from paperbot.monitor import PerUserMatches
+        from paperscout.monitor import PerUserMatches
         wl = UserWatchlist(fake_pool)
         wl.add("U1", "2300")
         paper = Paper(id="P2300R11", title="X", author="Unknown")
@@ -327,7 +327,7 @@ class TestUserWatchlist:
         assert wl.matches_for_users([paper], []) == {}
 
     def test_matches_for_users_probe_hit_author(self, fake_pool):
-        from paperbot.sources import ProbeHit
+        from paperscout.sources import ProbeHit
         wl = UserWatchlist(fake_pool)
         wl.add("U1", "niebler")
         hit = ProbeHit(
@@ -340,7 +340,7 @@ class TestUserWatchlist:
         assert len(result["U1"].probe_hits) == 1
 
     def test_matches_for_users_probe_hit_paper_number(self, fake_pool):
-        from paperbot.sources import ProbeHit
+        from paperscout.sources import ProbeHit
         wl = UserWatchlist(fake_pool)
         wl.add("U1", "9999")
         hit = ProbeHit(

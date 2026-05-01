@@ -1,7 +1,7 @@
-# paperbot-python
+# paperscout-python
 
-[![CI](https://github.com/CppDigest/paperbot-python/actions/workflows/ci.yml/badge.svg)](https://github.com/CppDigest/paperbot-python/actions/workflows/ci.yml)
-[![CD](https://github.com/CppDigest/paperbot-python/actions/workflows/cd.yml/badge.svg)](https://github.com/CppDigest/paperbot-python/actions/workflows/cd.yml)
+[![CI](https://github.com/cppalliance/paperscout-python/actions/workflows/ci.yml/badge.svg)](https://github.com/cppalliance/paperscout-python/actions/workflows/ci.yml)
+[![CD](https://github.com/cppalliance/paperscout-python/actions/workflows/cd.yml/badge.svg)](https://github.com/cppalliance/paperscout-python/actions/workflows/cd.yml)
 
 WG21 C++ paper tracker with ISO draft probing and Slack notifications.
 
@@ -9,7 +9,7 @@ A Python project that probes the isocpp.org paper system for unpublished D-paper
 
 ## Features
 
-- **Per-user watchlists** -- each user manages their own list of authors and paper numbers via DM; the bot sends a personal DM when a match is found
+- **Per-user watchlists** -- each user manages their own list of authors and paper numbers via DM; the scout sends a personal DM when a match is found
 - **ISO draft probing** -- Three-tier async HEAD requests to `isocpp.org/files/papers/` detect unpublished D-papers
 - **Frontier monitoring** -- Automatically probes newly assigned paper numbers beyond the current highest
 - **30-minute polling** -- Fetches wg21.link/index.json every 30 minutes (configurable)
@@ -23,7 +23,7 @@ A Python project that probes the isocpp.org paper system for unpublished D-paper
 
 1. Go to [https://api.slack.com/apps](https://api.slack.com/apps) and click **Create New App**
 2. Choose **From scratch**
-3. Name it `paperbot` (or whatever you prefer), select your workspace, click **Create App**
+3. Name it `paperscout` (or whatever you prefer), select your workspace, click **Create App**
 
 ### 2. Configure Bot Permissions
 
@@ -32,17 +32,17 @@ Go to **OAuth & Permissions** in the left sidebar. Under **Bot Token Scopes**, a
 | Scope | Why |
 |-------|-----|
 | `chat:write` | Post messages to channels and send DMs |
-| `chat:write.public` | Post to public channels the bot hasn't been invited to |
-| `im:history` | Read messages in 1:1 DMs with the bot |
+| `chat:write.public` | Post to public channels the scout hasn't been invited to |
+| `im:history` | Read messages in 1:1 DMs with the scout |
 | `im:write` | Open 1:1 DM conversations to deliver watchlist alerts |
-| `mpim:history` | Read messages in group DMs the bot has been invited to |
+| `mpim:history` | Read messages in group DMs the scout has been invited to |
 | `mpim:write` | Reply in group DMs |
 | `channels:history` | Read messages in public channels |
-| `groups:history` | Read messages in private channels the bot is invited to |
+| `groups:history` | Read messages in private channels the scout is invited to |
 | `groups:write` | Reply in private channels |
-| `app_mentions:read` | Respond when someone `@paperbot`s |
+| `app_mentions:read` | Respond when someone `@paperscout`s |
 
-> **Note on group DMs (`mpim`):** When the bot is invited to a group DM, `watchlist` commands are rejected with a friendly error telling the user to use a 1:1 DM instead. `status` and `help` work normally. The `mpim:history` and `mpim:write` scopes are needed to receive and reply to those messages.
+> **Note on group DMs (`mpim`):** When the scout is invited to a group DM, `watchlist` commands are rejected with a friendly error telling the user to use a 1:1 DM instead. `status` and `help` work normally. The `mpim:history` and `mpim:write` scopes are needed to receive and reply to those messages.
 
 ### 3. Enable Events
 
@@ -54,8 +54,8 @@ Go to **Event Subscriptions** in the left sidebar:
    - `message.groups` (messages in private channels)
    - `message.im` (1:1 direct messages)
    - `message.mpim` (group direct messages)
-   - `app_mention` (when someone @mentions the bot)
-3. You will set the **Request URL** after the bot is running (step 7)
+   - `app_mention` (when someone @mentions the scout)
+3. You will set the **Request URL** after the scout is running (step 7)
 
 ### 4. Enable DMs
 
@@ -72,10 +72,10 @@ Go to **App Home** in the left sidebar:
 4. Copy the **Bot User OAuth Token** (starts with `xoxb-`)
 5. Go to **Basic Information** and copy the **Signing Secret**
 
-### 6. Configure and Start the Bot
+### 6. Configure and Start the Scout
 
 ```bash
-cd paperbot-python
+cd paperscout-python
 cp .env.example .env
 ```
 
@@ -87,7 +87,7 @@ SLACK_BOT_TOKEN=xoxb-<your bot token from step 5>
 PORT=3000
 
 # PostgreSQL connection string (required)
-DATABASE_URL=postgresql://user:password@localhost:5432/paperbot
+DATABASE_URL=postgresql://user:password@localhost:5432/paperscout
 
 # Slack channel ID for general notifications (new frontier drafts, D→P transitions).
 # To find it: open the channel in Slack, click the channel name
@@ -101,16 +101,16 @@ Install and run:
 
 ```bash
 pip install -e .
-python -m paperbot
+python -m paperscout
 ```
 
 ### 7. Set the Request URL
 
-Once the bot is running and reachable at a public URL:
+Once the scout is running and reachable at a public URL:
 
 1. Go back to **Event Subscriptions** in the Slack app config
 2. Set **Request URL** to `https://your-server.com/slack/events`
-3. Slack will send a challenge request -- the bot responds automatically
+3. Slack will send a challenge request -- the scout responds automatically
 4. Click **Save Changes**
 
 For local testing with ngrok:
@@ -120,26 +120,26 @@ ngrok http 3000
 # Use the ngrok URL: https://abc123.ngrok.io/slack/events
 ```
 
-### 8. Invite the Bot
+### 8. Invite the Scout
 
-- **Public channel notifications:** The bot posts to `NOTIFICATION_CHANNEL` automatically (via `chat:write.public`). No invite needed.
-- **Private channels:** Type `/invite @paperbot` in the private channel for `@mention` support.
-- **Watchlist DMs (required):** Each user must open a 1:1 DM with `paperbot` to manage their personal watchlist. The bot will also DM users proactively when their watchlist matches a new paper.
-- **Group DMs:** The bot can be invited, but `watchlist` commands will be rejected with a message directing the user to use a 1:1 DM.
+- **Public channel notifications:** The scout posts to `NOTIFICATION_CHANNEL` automatically (via `chat:write.public`). No invite needed.
+- **Private channels:** Type `/invite @paperscout` in the private channel for `@mention` support.
+- **Watchlist DMs (required):** Each user must open a 1:1 DM with `paperscout` to manage their personal watchlist. The scout will also DM users proactively when their watchlist matches a new paper.
+- **Group DMs:** The scout can be invited, but `watchlist` commands will be rejected with a message directing the user to use a 1:1 DM.
 
 ### 9. Verify It Works
 
-1. DM the bot: `status` — should reply with papers loaded, last poll time, and probe stats
-2. DM the bot: `watchlist add Niebler` — should confirm the author was added (as an **author** entry)
-3. DM the bot: `watchlist add 2300` — should confirm the paper was added (as a **paper number** entry)
-4. DM the bot: `watchlist list` — should show both entries with their types
-5. DM the bot: `watchlist remove Niebler` — should confirm removal
-6. Type `@paperbot status` in a channel — should reply in-thread
+1. DM the scout: `status` — should reply with papers loaded, last poll time, and probe stats
+2. DM the scout: `watchlist add Niebler` — should confirm the author was added (as an **author** entry)
+3. DM the scout: `watchlist add 2300` — should confirm the paper was added (as a **paper number** entry)
+4. DM the scout: `watchlist list` — should show both entries with their types
+5. DM the scout: `watchlist remove Niebler` — should confirm removal
+6. Type `@paperscout status` in a channel — should reply in-thread
 7. Check your notification channel after 30 minutes — frontier hits and D→P transitions appear there; personal watchlist matches arrive as DMs
 
 ### Production Deployment
 
-The bot runs as a Docker container deployed via CD on every push to `main`. It connects to the host's shared PostgreSQL and sits behind nginx (TLS on `:443`).
+The scout runs as a Docker container deployed via CD on every push to `main`. It connects to the host's shared PostgreSQL and sits behind nginx (TLS on `:443`).
 
 ```
 Push to main → CI tests → SSH into server → git pull → docker compose up --build → Health check
@@ -149,8 +149,8 @@ Quick start on a fresh server:
 
 ```bash
 # On the server (after Docker, PostgreSQL, and nginx are set up)
-git clone https://github.com/CppDigest/paperbot-python.git /opt/paperbot
-cd /opt/paperbot
+git clone https://github.com/cppalliance/paperscout-python.git /opt/paperscout
+cd /opt/paperscout
 cp .env.example .env        # edit with real credentials
 docker compose up -d --build
 curl -sf http://localhost:9101/health
@@ -160,9 +160,9 @@ See [`deploy/SERVER_SETUP.md`](deploy/SERVER_SETUP.md) for the full Ubuntu 22.04
 
 Database backups run daily via [`.github/workflows/db-backup.yml`](.github/workflows/db-backup.yml), uploading `pg_dump` snapshots to Google Cloud Storage.
 
-## Bot Commands
+## Scout Commands
 
-Watchlist commands only work in a **1:1 DM** with the bot (each user has their own independent watchlist). `status` and `help` work everywhere — DMs, group DMs, and channels via `@paperbot`.
+Watchlist commands only work in a **1:1 DM** with the scout (each user has their own independent watchlist). `status` and `help` work everywhere — DMs, group DMs, and channels via `@paperscout`.
 
 | Command | Where | Description |
 |---------|-------|-------------|
@@ -268,20 +268,20 @@ All parameters are configurable via environment variables or a `.env` file. See 
 ## Architecture
 
 ```
-paperbot-python/
-  src/paperbot/
+paperscout-python/
+  src/paperscout/
     __main__.py     Entry point; wires together all components
     config.py       All settings via pydantic-settings
     models.py       Paper dataclass, PaperPrefix/PaperType/FileExt enums
     sources.py      WG21Index (PaperCache-backed), ISOProber, open-std.org scraper
     monitor.py      Scheduler, diff engine, PerUserMatches, PollResult
-    bot.py          Slack Bolt app, MessageQueue, notify_channel, notify_users
+    scout.py        Slack Bolt app, MessageQueue, notify_channel, notify_users
     storage.py      PaperCache, ProbeState, UserWatchlist (all PostgreSQL-backed)
     db.py           ThreadedConnectionPool init and schema DDL
     health.py       HTTP health-check endpoint (GET /health on port 8080)
   data/             Log files (gitignored); all other state lives in PostgreSQL
   deploy/
-    paperbot.conf   Reference nginx site config (443 → 3000, /health → 8080)
+    paperscout.conf Reference nginx site config (443 → 3000, /health → 8080)
     SERVER_SETUP.md Full Ubuntu 22.04 server provisioning guide
   tests/
   Dockerfile        Multi-stage build (python:3.12-slim)
@@ -318,7 +318,7 @@ Typical per-cycle request count: **~1,600–2,000 HEAD requests** (~8–10 s at 
 
 ### Alerting by Last-Modified
 
-When a HEAD probe returns 200, the bot reads the `Last-Modified` response header. It only sends a Slack notification if the file was modified within `ALERT_MODIFIED_HOURS` (default 24 h). This means:
+When a HEAD probe returns 200, the scout reads the `Last-Modified` response header. It only sends a Slack notification if the file was modified within `ALERT_MODIFIED_HOURS` (default 24 h). This means:
 
 - A D-paper uploaded today → **alert sent**
 - A D-paper uploaded 6 months ago that we hadn't tracked → **silently added to discovered, no alert**
@@ -347,8 +347,8 @@ The `Last-Modified` timestamp is shown in every notification message.
 ### Setup
 
 ```bash
-git clone https://github.com/CppDigest/paperbot-python.git
-cd paperbot-python
+git clone https://github.com/cppalliance/paperscout-python.git
+cd paperscout-python
 python -m venv .venv
 source .venv/bin/activate  # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"
@@ -409,7 +409,7 @@ The app container connects to the host's shared PostgreSQL via `host.docker.inte
 The `.github/workflows/db-backup.yml` workflow runs daily at 3 AM UTC (and supports manual dispatch):
 
 1. SSHes into the server and runs `pg_dump` on the host's PostgreSQL
-2. Uploads the dump to Google Cloud Storage (`gs://paperbot-backups/`)
+2. Uploads the dump to Google Cloud Storage (`gs://paperscout-backups/`)
 3. Old backups are auto-pruned by a GCS lifecycle rule (30 days)
 
 Required GitHub Secrets for CD and backups are documented in [`deploy/SERVER_SETUP.md`](deploy/SERVER_SETUP.md#9-github-secrets-checklist).

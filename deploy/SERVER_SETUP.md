@@ -1,7 +1,7 @@
 # Server Setup — Ubuntu 22.04
 
 Step-by-step guide for provisioning a fresh Ubuntu 22.04 server to run
-paperbot alongside other apps that share the same PostgreSQL and nginx.
+paperscout alongside other apps that share the same PostgreSQL and nginx.
 
 ---
 
@@ -50,7 +50,7 @@ newgrp docker
 ## 3. PostgreSQL 16 (shared instance)
 
 If PostgreSQL is already running for other apps, skip the install and jump
-to **Create the paperbot database**.
+to **Create the paperscout database**.
 
 ```bash
 # Add PGDG repo
@@ -66,43 +66,43 @@ sudo apt install -y postgresql-16
 sudo systemctl enable --now postgresql
 ```
 
-### Create the paperbot database
+### Create the paperscout database
 
 ```bash
 sudo -u postgres psql <<'SQL'
-CREATE USER paperbot WITH PASSWORD <password>;
-CREATE DATABASE paperbot OWNER paperbot;
+CREATE USER paperscout WITH PASSWORD <password>;
+CREATE DATABASE paperscout OWNER paperscout;
 SQL
 ```
 
 ### Migrate data from an existing deployment (optional)
 
-If you are replacing an old server that already has a running paperbot
+If you are replacing an old server that already has a running paperscout
 database, dump it on the **old** server and restore it on the new one:
 
 ```bash
 # --- On the OLD server ---
-pg_dump -U postgres -Fc paperbot > /tmp/paperbot.dump
+pg_dump -U postgres -Fc paperscout > /tmp/paperscout.dump
 # or on Windows
-"C:/Program Files/PostgreSQL/18/bin/pg_dump" -U postgres -Fc paperbot > paperbot.dump
+"C:/Program Files/PostgreSQL/18/bin/pg_dump" -U postgres -Fc paperscout > paperscout.dump
 
 # Copy the dump to the new server
-scp /tmp/paperbot.dump <user>@<new-server>:/tmp/paperbot.dump
+scp /tmp/paperscout.dump <user>@<new-server>:/tmp/paperscout.dump
 ```
 
 ```bash
 # --- On the NEW server (after creating the database above) ---
-pg_restore -U paperbot -d paperbot --no-owner paperbot.dump
-rm /tmp/paperbot.dump
+pg_restore -U paperscout -d paperscout --no-owner /tmp/paperscout.dump
+rm /tmp/paperscout.dump
 ```
 
 If the dump is stored in GCS (from the daily backup workflow),
 download it directly on the new server instead:
 
 ```bash
-gsutil cp gs://paperbot-backup/paperbot-<YYYYMMDD>.dump /tmp/paperbot.dump
-pg_restore -U paperbot -h localhost -d paperbot --no-owner /tmp/paperbot.dump
-rm /tmp/paperbot.dump
+gsutil cp gs://paperscout-backups/paperscout-<YYYYMMDD>.dump /tmp/paperscout.dump
+pg_restore -U paperscout -h localhost -d paperscout --no-owner /tmp/paperscout.dump
+rm /tmp/paperscout.dump
 ```
 
 ### Allow Docker containers to connect
@@ -117,7 +117,7 @@ sudo sed -i "s/^#listen_addresses.*/listen_addresses = '*'/" \
   /etc/postgresql/16/main/postgresql.conf
 
 # pg_hba.conf — allow the Docker bridge subnet
-echo "host  paperbot  paperbot  172.16.0.0/12  scram-sha-256" | \
+echo "host  paperscout  paperscout  172.16.0.0/12  scram-sha-256" | \
   sudo tee -a /etc/postgresql/16/main/pg_hba.conf
 
 sudo systemctl restart postgresql
@@ -140,7 +140,7 @@ sudo certbot --nginx -d dev.cppdigest.org
 ```
 
 Certbot creates a server block for `dev.cppdigest.org` in the default
-nginx config. Add the paperbot location blocks **inside that existing
+nginx config. Add the paperscout location blocks **inside that existing
 server block** (do NOT create a separate server block -- nginx will
 ignore it in favour of the first match).
 
@@ -148,12 +148,12 @@ Open the config and find the `dev.cppdigest.org` server block with
 `listen 443 ssl;`. Add these lines before its closing `}`:
 
 ```nginx
-    # --- paperbot ---
-    location /paperbot/health {
+    # --- paperscout ---
+    location /paperscout/health {
         proxy_pass http://127.0.0.1:9101/health;
     }
 
-    location /paperbot/ {
+    location /paperscout/ {
         proxy_pass http://127.0.0.1:9100/;
         proxy_set_header Host              $host;
         proxy_set_header X-Real-IP         $remote_addr;
@@ -163,7 +163,7 @@ Open the config and find the `dev.cppdigest.org` server block with
 ```
 
 A reference copy of these blocks lives in
-[`deploy/paperbot.conf`](paperbot.conf).
+[`deploy/paperscout.conf`](paperscout.conf).
 
 ```bash
 sudo nginx -t && sudo systemctl reload nginx
@@ -173,18 +173,18 @@ sudo nginx -t && sudo systemctl reload nginx
 
 ## 5. App deployment directory
 
-Clone the repo into `/opt/paperbot`:
+Clone the repo into `/opt/paperscout`:
 
 ```bash
 sudo mkdir -p /opt
-sudo git clone https://github.com/CppDigest/paperbot-python.git /opt/paperbot
-sudo chown -R gcp-cppdigest:gcp-cppdigest /opt/paperbot
+sudo git clone https://github.com/cppalliance/paperscout-python.git /opt/paperscout
+sudo chown -R gcp-cppdigest:gcp-cppdigest /opt/paperscout
 ```
 
 Create the `.env` file:
 
 ```bash
-cd /opt/paperbot
+cd /opt/paperscout
 cp .env.example .env
 # Edit with real credentials:
 #   SLACK_SIGNING_SECRET, SLACK_BOT_TOKEN, DATABASE_URL, NOTIFICATION_CHANNEL
@@ -194,7 +194,7 @@ nano .env
 The `DATABASE_URL` should use `host.docker.internal`:
 
 ```
-DATABASE_URL=postgresql://paperbot:<password>@host.docker.internal:5432/paperbot
+DATABASE_URL=postgresql://paperscout:<password>@host.docker.internal:5432/paperscout
 ```
 
 > **Note:** If the password contains special characters, they must be
@@ -206,13 +206,13 @@ DATABASE_URL=postgresql://paperbot:<password>@host.docker.internal:5432/paperbot
 ## 6. First launch
 
 ```bash
-cd /opt/paperbot
+cd /opt/paperscout
 docker compose up -d --build
 
 # Verify
 sleep 5
 curl -sf http://localhost:9101/health | python3 -m json.tool
-docker compose logs -f paperbot
+docker compose logs -f paperscout
 ```
 
 ---
@@ -222,9 +222,9 @@ docker compose logs -f paperbot
 If migrating from another server with an existing database:
 
 ```bash
-gsutil cp gs://paperbot-backup/paperbot-<YYYYMMDD>.dump /tmp/paperbot.dump
-pg_restore -U paperbot -h localhost -d paperbot -c /tmp/paperbot.dump
-rm /tmp/paperbot.dump
+gsutil cp gs://paperscout-backups/paperscout-<YYYYMMDD>.dump /tmp/paperscout.dump
+pg_restore -U paperscout -h localhost -d paperscout -c /tmp/paperscout.dump
+rm /tmp/paperscout.dump
 ```
 
 ---
@@ -235,7 +235,7 @@ The `db-backup.yml` GitHub Actions workflow SSHes into the server daily
 and runs `pg_dump` + `gsutil cp` to upload to GCS. The VM's service
 account handles authentication automatically — no credentials needed.
 
-The GCS bucket `paperbot-backup` should have a lifecycle rule to
+The GCS bucket `paperscout-backups` should have a lifecycle rule to
 auto-delete objects older than 30 days (configured in the Cloud Console
 under the bucket's **Lifecycle** tab).
 
@@ -245,12 +245,12 @@ under the bucket's **Lifecycle** tab).
 
 Configure these in the repo under **Settings → Secrets and variables → Actions**:
 
-| Secret           | Purpose                              |
-| ---------------- | ------------------------------------ |
-| `SERVER_HOST`    | Server IP or hostname                |
-| `SERVER_USER`    | SSH username (e.g. `gcp-cppdigest`)  |
-| `SERVER_SSH_KEY` | Private SSH key for the deploy user  |
-| `SERVER_PORT`    | SSH port (optional, defaults to 22)  |
+| Secret           | Purpose                             |
+| ---------------- | ----------------------------------- |
+| `SERVER_HOST`    | Server IP or hostname               |
+| `SERVER_USER`    | SSH username (e.g. `gcp-cppdigest`) |
+| `SERVER_SSH_KEY` | Private SSH key for the deploy user |
+| `SERVER_PORT`    | SSH port (optional, defaults to 22) |
 
 `GITHUB_TOKEN` is provided automatically by GitHub Actions.
 GCS authentication uses the VM's service account — no extra secrets needed.

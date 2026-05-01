@@ -22,7 +22,7 @@ case "$target" in
 
   cov)
     "$PYTHON" -m pytest tests/ \
-      --cov=paperbot \
+      --cov=paperscout \
       --cov-report=term-missing \
       --cov-report=xml \
       --cov-fail-under=90 \

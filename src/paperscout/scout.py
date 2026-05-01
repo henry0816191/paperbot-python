@@ -276,9 +276,9 @@ def register_handlers(
                     "Commands:\n"
                     "• `watchlist add|remove|list [name-or-paper-number]` — "
                     "manage your personal watchlist (DM only)\n"
-                    "• `status` — show bot status\n"
-                    "• `version` — show bot version\n"
-                    "• `uptime` — show how long the bot has been running\n"
+                    "• `status` — show scout status\n"
+                    "• `version` — show scout version\n"
+                    "• `uptime` — show how long the scout has been running\n"
                     "• `help` — this message"
                 ),
                 **reply_opts,
@@ -329,14 +329,14 @@ def register_handlers(
         user_id = event.get("user", "")
 
         if channel_type == "im":
-            # Strip bot mention if present (e.g. user typed @bot watchlist ...)
+            # Strip scout mention if present (e.g. user typed @scout watchlist ...)
             if bot_id and f"<@{bot_id}>" in text:
                 text = text.split(f"<@{bot_id}>", 1)[-1].strip()
             if text:
                 _dispatch(text, user_id, channel_type, say=say, reply_opts=_reply_opts(event))
 
         elif channel_type == "mpim":
-            # Only respond if the bot is mentioned
+            # Only respond if the scout is mentioned
             if bot_id and f"<@{bot_id}>" in text:
                 text = text.split(f"<@{bot_id}>", 1)[-1].strip()
                 if text:
@@ -418,7 +418,7 @@ def _handle_status(state: ProbeState, paper_count_fn, say, reply_opts: dict) -> 
     last_str = _dt.fromtimestamp(last).strftime("%Y-%m-%d %H:%M:%S") if last else "never"
     say(
         text=(
-            f"*Paperbot Status*\n"
+            f"*Paperscout Status*\n"
             f"• Papers loaded: {paper_count_fn():,}\n"
             f"• Last poll: {last_str}\n"
             f"• Poll interval: {settings.poll_interval_minutes} min\n"
@@ -433,7 +433,7 @@ def _handle_status(state: ProbeState, paper_count_fn, say, reply_opts: dict) -> 
 
 def _handle_version(say, reply_opts: dict) -> None:
     from . import __version__
-    say(text=f"Paperbot v{__version__}", **reply_opts)
+    say(text=f"Paperscout v{__version__}", **reply_opts)
 
 
 def _format_uptime(delta) -> str:
@@ -458,6 +458,6 @@ def _handle_uptime(launch_time: datetime | None, say, reply_opts: dict) -> None:
     delta = now - launch_time
     started_str = launch_time.strftime("%Y-%m-%d %H:%M:%S UTC")
     say(
-        text=f"Paperbot started {_format_uptime(delta)} ago ({started_str})",
+        text=f"Paperscout started {_format_uptime(delta)} ago ({started_str})",
         **reply_opts,
     )

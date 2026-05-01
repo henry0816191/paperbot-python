@@ -1,4 +1,5 @@
-"""Shared fixtures and helpers for the paperbot test suite."""
+"""Shared fixtures and helpers for the paperscout test suite."""
+
 from __future__ import annotations
 
 import json as _json
@@ -6,24 +7,25 @@ from pathlib import Path
 
 import pytest
 
-from paperbot.config import Settings
-from paperbot.models import Paper
-from paperbot.storage import ProbeState, UserWatchlist
-from paperbot.sources import WG21Index
-
+from paperscout.config import Settings
+from paperscout.models import Paper
+from paperscout.storage import ProbeState, UserWatchlist
+from paperscout.sources import WG21Index
+import tempfile
 
 # ── FakePool ─────────────────────────────────────────────────────────────────
 # An in-memory substitute for psycopg2.pool.ThreadedConnectionPool that
 # interprets the exact SQL patterns used by PaperCache, ProbeState, and
 # UserWatchlist.  No real PostgreSQL server is required.
 
+
 class _FakeStore:
     def __init__(self):
-        self.paper_cache: dict = {}    # key -> (data_dict, written_at)
-        self.discovered: dict = {}     # url -> (last_modified, discovered_at)
-        self.misses: dict = {}         # paper_num -> count
+        self.paper_cache: dict = {}  # key -> (data_dict, written_at)
+        self.discovered: dict = {}  # url -> (last_modified, discovered_at)
+        self.misses: dict = {}  # paper_num -> count
         self.last_poll: float = 0.0
-        self.watchlist: dict = {}      # (user_id, entry) -> entry_type
+        self.watchlist: dict = {}  # (user_id, entry) -> entry_type
 
 
 class _FakeCursor:
@@ -33,8 +35,11 @@ class _FakeCursor:
         self._row = None
         self._rows: list = []
 
-    def __enter__(self): return self
-    def __exit__(self, *_): pass
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        pass
 
     def execute(self, sql: str, params=()):
         self._row = None
@@ -75,10 +80,7 @@ class _FakeCursor:
             self._row = (r[0], r[1]) if r else None
 
         elif "SELECT URL, LAST_MODIFIED, DISCOVERED_AT FROM DISCOVERED_URLS" in su:
-            self._rows = [
-                (url, lm, da)
-                for url, (lm, da) in self._s.discovered.items()
-            ]
+            self._rows = [(url, lm, da) for url, (lm, da) in self._s.discovered.items()]
 
         elif "SELECT URL FROM DISCOVERED_URLS" in su and "LAST_MODIFIED" not in su:
             self._rows = [(url,) for url in self._s.discovered]
@@ -114,7 +116,9 @@ class _FakeCursor:
                 self._s.watchlist[key] = etype
                 self.rowcount = 1
 
-        elif "DELETE FROM USER_WATCHLIST WHERE SLACK_USER_ID" in su and "AND ENTRY" in su:
+        elif (
+            "DELETE FROM USER_WATCHLIST WHERE SLACK_USER_ID" in su and "AND ENTRY" in su
+        ):
             uid, entry = params[0], params[1]
             key = (uid, entry)
             if key in self._s.watchlist:
@@ -127,7 +131,9 @@ class _FakeCursor:
             self._rows = sorted(rows, key=lambda x: (x[1], x[0]))
 
         elif "SELECT ENTRY FROM USER_WATCHLIST WHERE ENTRY_TYPE" in su:
-            self._rows = [(e,) for (_, e), t in self._s.watchlist.items() if t == "paper"]
+            self._rows = [
+                (e,) for (_, e), t in self._s.watchlist.items() if t == "paper"
+            ]
 
         elif "SELECT SLACK_USER_ID, ENTRY, ENTRY_TYPE FROM USER_WATCHLIST" in su:
             self._rows = [(u, e, t) for (u, e), t in self._s.watchlist.items()]
@@ -146,8 +152,11 @@ class _FakeConn:
     def cursor(self):
         return self._cur
 
-    def commit(self): pass
-    def rollback(self): pass
+    def commit(self):
+        pass
+
+    def rollback(self):
+        pass
 
 
 class FakePool:
@@ -168,6 +177,7 @@ class FakePool:
 
 
 # ── Settings factory ──────────────────────────────────────────────────────────
+
 
 def make_test_settings(**overrides) -> Settings:
     """Build a Settings instance with safe test defaults (no I/O, no credentials)."""
@@ -200,7 +210,7 @@ def make_test_settings(**overrides) -> Settings:
         notify_on_frontier_hit=True,
         notify_on_any_draft=True,
         notify_on_dp_transition=True,
-        data_dir=Path("/tmp/paperbot-test"),
+        data_dir=Path(tempfile.mkdtemp(prefix="paperscout-test-")),
         cache_ttl_hours=1,
     )
     base.update(overrides)
@@ -240,6 +250,7 @@ SAMPLE_INDEX_DATA: dict = {
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
+
 
 @pytest.fixture
 def fake_pool() -> FakePool:

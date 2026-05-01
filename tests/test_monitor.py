@@ -1,4 +1,4 @@
-"""Tests for paperbot.monitor."""
+"""Tests for paperscout.monitor."""
 from __future__ import annotations
 
 import asyncio
@@ -7,16 +7,16 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from paperbot.models import Paper
-from paperbot.monitor import (
+from paperscout.models import Paper
+from paperscout.monitor import (
     DiffResult,
     PerUserMatches,
     PollResult,
     Scheduler,
     diff_snapshots,
 )
-from paperbot.sources import ISOProber, ProbeHit, WG21Index
-from paperbot.storage import ProbeState, UserWatchlist
+from paperscout.sources import ISOProber, ProbeHit, WG21Index
+from paperscout.storage import ProbeState, UserWatchlist
 from tests.conftest import make_test_settings
 
 
@@ -111,7 +111,7 @@ class TestPollResult:
         assert result.per_user_matches == {}
 
     def test_explicit_dp_transitions(self):
-        from paperbot.monitor import DPTransition
+        from paperscout.monitor import DPTransition
         diff = DiffResult(new_papers=[], updated_papers=[])
         paper = Paper(id="P2300R11")
         tr = DPTransition(paper=paper, draft_url="http://x", last_modified=None, discovered_at=0.0)
@@ -378,7 +378,7 @@ class TestScheduler:
         async def capture_sleep(duration: float):
             slept.append(duration)
 
-        with patch("paperbot.monitor.time") as mock_time:
+        with patch("paperscout.monitor.time") as mock_time:
             mock_time.monotonic.side_effect = [0.0, 360.0, 0.0]
             scheduler.poll_once = mock_poll_once
             with patch("asyncio.sleep", capture_sleep):
@@ -404,7 +404,7 @@ class TestScheduler:
         async def capture_sleep(duration: float):
             slept.append(duration)
 
-        with patch("paperbot.monitor.time") as mock_time:
+        with patch("paperscout.monitor.time") as mock_time:
             mock_time.monotonic.side_effect = [0.0, 2000.0, 0.0]
             scheduler.poll_once = mock_poll_once
             with patch("asyncio.sleep", capture_sleep):

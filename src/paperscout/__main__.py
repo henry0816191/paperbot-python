@@ -1,4 +1,4 @@
-"""Entry point: python -m paperbot"""
+"""Entry point: python -m paperscout"""
 from __future__ import annotations
 
 import asyncio
@@ -11,14 +11,14 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 from .config import settings
-from .bot import MessageQueue, create_app, notify_channel, notify_users, register_handlers
+from .scout import MessageQueue, create_app, notify_channel, notify_users, register_handlers
 from .db import init_db, init_pool
 from .health import start_health_server
 from .monitor import Scheduler
 from .sources import ISOProber, WG21Index
 from .storage import ProbeState, UserWatchlist
 
-log = logging.getLogger("paperbot")
+log = logging.getLogger("paperscout")
 
 
 def _setup_logging(data_dir: Path, console_level: str = "INFO",
@@ -26,7 +26,7 @@ def _setup_logging(data_dir: Path, console_level: str = "INFO",
     """Configure root logger with:
 
     • Console (stderr) — at *console_level*, for interactive monitoring.
-    • Rotating file (data_dir/paperbot.log) — at *console_level*, rotated
+    • Rotating file (data_dir/paperscout.log) — at *console_level*, rotated
       midnight each day, keeping *retention_days* days of history.
 
     Noisy third-party libraries are silenced to WARNING regardless.
@@ -39,7 +39,7 @@ def _setup_logging(data_dir: Path, console_level: str = "INFO",
     )
 
     fh = logging.handlers.TimedRotatingFileHandler(
-        filename=data_dir / "paperbot.log",
+        filename=data_dir / "paperscout.log",
         when="midnight",
         backupCount=retention_days,
         encoding="utf-8",
@@ -73,9 +73,9 @@ async def _async_main() -> None:
     )
 
     log.info(
-        "=== Paperbot starting  port=%d  poll=%dmin  data=%s  log=%s ===",
+        "=== Paperscout starting  port=%d  poll=%dmin  data=%s  log=%s ===",
         settings.port, settings.poll_interval_minutes,
-        data_dir, data_dir / "paperbot.log",
+        data_dir, data_dir / "paperscout.log",
     )
     log.info(
         "Settings: hot_lookback=%dmo  hot_depth=%d  cold_divisor=%d  "
@@ -131,7 +131,7 @@ def main() -> None:
     try:
         asyncio.run(_async_main())
     except KeyboardInterrupt:
-        log.info("=== Paperbot shutting down (KeyboardInterrupt) ===")
+        log.info("=== Paperscout shutting down (KeyboardInterrupt) ===")
         sys.exit(0)
 
 
