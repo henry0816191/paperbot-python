@@ -19,3 +19,23 @@ build/
 
 # Pytest cache
 .pytest_cache/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+**/.___*
+**/._*
+.Spotlight-V100
+.Trashes
+.fseventsd
+.TemporaryItems
+.AppleDB
+.AppleDesktop
+.apdisk
+Icon?
+Network Trash Folder
+Temporary Items
+.com.apple.timemachine.donotpresent
+.VolumeIcon.icns

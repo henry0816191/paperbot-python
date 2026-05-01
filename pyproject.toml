@@ -6,6 +6,8 @@ build-backend = "hatchling.build"
 name = "paperbot"
 version = "0.1.0"
 description = "WG21 C++ paper tracker with ISO draft probing and Slack notifications"
+license = "BSL-1.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 dependencies = [
     "slack-bolt",
