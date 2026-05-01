@@ -20,7 +20,7 @@ jobs:
         run: pip install -e ".[dev]"
 
       - name: Run tests
-        run: python -m pytest tests/ --cov=paperbot --cov-fail-under=90 -v
+        run: python -m pytest tests/ --cov=paperscout --cov-fail-under=90 -v
 
   deploy:
     name: Deploy
@@ -35,9 +35,9 @@ jobs:
           key: ${{ secrets.SERVER_SSH_KEY }}
           port: ${{ secrets.SERVER_PORT || 22 }}
           script: |
-            cd /opt/paperbot
+            cd /opt/paperscout
             git pull origin main
-            docker compose up -d --build paperbot
+            docker compose up -d --build paperscout
 
       - name: Health check
         uses: appleboy/ssh-action@v1

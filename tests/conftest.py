@@ -1,4 +1,4 @@
-"""Shared fixtures and helpers for the paperbot test suite."""
+"""Shared fixtures and helpers for the paperscout test suite."""
 from __future__ import annotations
 
 import json as _json
@@ -6,10 +6,10 @@ from pathlib import Path
 
 import pytest
 
-from paperbot.config import Settings
-from paperbot.models import Paper
-from paperbot.storage import ProbeState, UserWatchlist
-from paperbot.sources import WG21Index
+from paperscout.config import Settings
+from paperscout.models import Paper
+from paperscout.storage import ProbeState, UserWatchlist
+from paperscout.sources import WG21Index
 
 
 # ── FakePool ─────────────────────────────────────────────────────────────────
@@ -200,7 +200,7 @@ def make_test_settings(**overrides) -> Settings:
         notify_on_frontier_hit=True,
         notify_on_any_draft=True,
         notify_on_dp_transition=True,
-        data_dir=Path("/tmp/paperbot-test"),
+        data_dir=Path("/tmp/paperscout-test"),
         cache_ttl_hours=1,
     )
     base.update(overrides)

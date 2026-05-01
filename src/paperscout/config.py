@@ -83,7 +83,7 @@ class Settings(BaseSettings):
     cache_ttl_hours: int = 1
 
     # -- Logging --
-    # Console log level.  The rotating file (data_dir/paperbot.log) always
+    # Console log level.  The rotating file (data_dir/paperscout.log) always
     # captures DEBUG so nothing is lost for post-hoc analysis.
     log_level: str = "INFO"
     # Days of log files to keep (one file per day).

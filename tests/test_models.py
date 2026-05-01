@@ -1,9 +1,9 @@
-"""Tests for paperbot.models."""
+"""Tests for paperscout.models."""
 from __future__ import annotations
 
 import pytest
 
-from paperbot.models import FileExt, Paper, PaperPrefix, PaperType
+from paperscout.models import FileExt, Paper, PaperPrefix, PaperType
 
 
 # ── Enum sanity ──────────────────────────────────────────────────────────────

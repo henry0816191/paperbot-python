@@ -1,4 +1,4 @@
-"""Tests for paperbot.health."""
+"""Tests for paperscout.health."""
 from __future__ import annotations
 
 import json
@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from paperbot.health import start_health_server
+from paperscout.health import start_health_server
 
 
 def _find_free_port() -> int:

@@ -1,4 +1,4 @@
-"""Tests for paperbot.bot."""
+"""Tests for paperscout.scout."""
 from __future__ import annotations
 
 from datetime import datetime, timezone, timedelta
@@ -6,11 +6,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from paperbot.models import Paper
-from paperbot.monitor import DiffResult, DPTransition, PerUserMatches, PollResult
-from paperbot.sources import ProbeHit
-from paperbot.storage import ProbeState, UserWatchlist
-from paperbot.bot import (
+from paperscout.models import Paper
+from paperscout.monitor import DiffResult, DPTransition, PerUserMatches, PollResult
+from paperscout.sources import ProbeHit
+from paperscout.storage import ProbeState, UserWatchlist
+from paperscout.scout import (
     MessageQueue,
     _batch_lines,
     _fmt_lm,
@@ -126,14 +126,14 @@ class TestNotifyChannel:
     def test_no_channel_returns_silently(self):
         app = MagicMock()
         mq = MagicMock()
-        with patch("paperbot.bot.settings", _make_settings(channel="")):
+        with patch("paperscout.scout.settings", _make_settings(channel="")):
             notify_channel(app, _make_result(), mq)
         mq.enqueue.assert_not_called()
 
     def test_empty_result_posts_nothing(self):
         app = MagicMock()
         mq = MagicMock()
-        with patch("paperbot.bot.settings", _make_settings()):
+        with patch("paperscout.scout.settings", _make_settings()):
             notify_channel(app, _make_result(), mq)
         mq.enqueue.assert_not_called()
 
@@ -144,7 +144,7 @@ class TestNotifyChannel:
         mq = MagicMock()
         hits = [_recent_hit(tier="frontier", number=n) for n in (4033, 4034, 4035)]
         result = _make_result(probe_hits=hits)
-        with patch("paperbot.bot.settings", _make_settings()):
+        with patch("paperscout.scout.settings", _make_settings()):
             notify_channel(app, result, mq)
         mq.enqueue.assert_called_once()
         text = mq.enqueue.call_args[0][1]
@@ -157,7 +157,7 @@ class TestNotifyChannel:
         mq = MagicMock()
         hits = [_recent_hit(tier="recent", number=n) for n in (5000, 5001)]
         result = _make_result(probe_hits=hits)
-        with patch("paperbot.bot.settings", _make_settings()):
+        with patch("paperscout.scout.settings", _make_settings()):
             notify_channel(app, result, mq)
         text = mq.enqueue.call_args[0][1]
         assert "2 new draft(s) discovered" in text
@@ -167,7 +167,7 @@ class TestNotifyChannel:
         mq = MagicMock()
         hit = _recent_hit(tier="cold")
         result = _make_result(probe_hits=[hit])
-        with patch("paperbot.bot.settings", _make_settings()):
+        with patch("paperscout.scout.settings", _make_settings()):
             notify_channel(app, result, mq)
         assert "1 new draft(s) discovered" in mq.enqueue.call_args[0][1]
 
@@ -175,7 +175,7 @@ class TestNotifyChannel:
         app = MagicMock()
         mq = MagicMock()
         result = _make_result(probe_hits=[_recent_hit(tier="frontier")])
-        with patch("paperbot.bot.settings", _make_settings(notify_on_frontier_hit=False)):
+        with patch("paperscout.scout.settings", _make_settings(notify_on_frontier_hit=False)):
             notify_channel(app, result, mq)
         mq.enqueue.assert_not_called()
 
@@ -184,7 +184,7 @@ class TestNotifyChannel:
         mq = MagicMock()
         for tier in ("recent", "cold"):
             result = _make_result(probe_hits=[_recent_hit(tier=tier)])
-            with patch("paperbot.bot.settings", _make_settings(notify_on_any_draft=False)):
+            with patch("paperscout.scout.settings", _make_settings(notify_on_any_draft=False)):
                 notify_channel(app, result, mq)
         mq.enqueue.assert_not_called()
 
@@ -194,7 +194,7 @@ class TestNotifyChannel:
         lm = datetime.now(timezone.utc) - timedelta(hours=3)
         hit = _recent_hit(tier="frontier", last_modified=lm)
         result = _make_result(probe_hits=[hit])
-        with patch("paperbot.bot.settings", _make_settings()):
+        with patch("paperscout.scout.settings", _make_settings()):
             notify_channel(app, result, mq)
         assert "3h ago" in mq.enqueue.call_args[0][1]
 
@@ -209,7 +209,7 @@ class TestNotifyChannel:
                           draft_url="https://isocpp.org/files/papers/D2300R11.pdf",
                           last_modified=1_700_000_000.0, discovered_at=1_699_900_000.0)
         result = _make_result(dp_transitions=[tr])
-        with patch("paperbot.bot.settings", _make_settings()):
+        with patch("paperscout.scout.settings", _make_settings()):
             notify_channel(app, result, mq)
         text = mq.enqueue.call_args[0][1]
         assert "draft(s) now published" in text
@@ -224,7 +224,7 @@ class TestNotifyChannel:
                           draft_url="https://isocpp.org/files/papers/D2300R11.pdf",
                           last_modified=None, discovered_at=0.0)
         result = _make_result(dp_transitions=[tr])
-        with patch("paperbot.bot.settings", _make_settings(notify_on_dp_transition=False)):
+        with patch("paperscout.scout.settings", _make_settings(notify_on_dp_transition=False)):
             notify_channel(app, result, mq)
         mq.enqueue.assert_not_called()
 
@@ -236,7 +236,7 @@ class TestNotifyChannel:
                           draft_url="https://isocpp.org/files/papers/D9999R0.pdf",
                           last_modified=None, discovered_at=0.0)
         result = _make_result(dp_transitions=[tr])
-        with patch("paperbot.bot.settings", _make_settings()):
+        with patch("paperscout.scout.settings", _make_settings()):
             notify_channel(app, result, mq)
         text = mq.enqueue.call_args[0][1]
         assert "draft(s) now published" in text
@@ -445,7 +445,7 @@ class TestHandleStatus:
     def test_status_never_polled(self, fake_pool):
         state = ProbeState(fake_pool)
         say = MagicMock()
-        with patch("paperbot.bot.settings", _make_settings()):
+        with patch("paperscout.scout.settings", _make_settings()):
             _handle_status(state, lambda: 42, say, {})
         text = say.call_args[1]["text"]
         assert "42" in text and "never" in text
@@ -454,7 +454,7 @@ class TestHandleStatus:
         state = ProbeState(fake_pool)
         state.touch_poll()
         say = MagicMock()
-        with patch("paperbot.bot.settings", _make_settings()):
+        with patch("paperscout.scout.settings", _make_settings()):
             _handle_status(state, lambda: 100, say, {})
         text = say.call_args[1]["text"]
         assert "100" in text and "never" not in text
@@ -482,7 +482,7 @@ class TestRegisterHandlers:
     def test_app_mention_status(self, fake_pool):
         registered, _, _ = self._setup(fake_pool)
         say = MagicMock()
-        with patch("paperbot.bot.settings", _make_settings()):
+        with patch("paperscout.scout.settings", _make_settings()):
             registered["app_mention"](
                 event={"text": "<@U1> status", "ts": "1", "user": "U1"},
                 context={"bot_user_id": "U1"},
@@ -513,7 +513,7 @@ class TestRegisterHandlers:
     def test_message_dm_dispatches(self, fake_pool):
         registered, _, _ = self._setup(fake_pool)
         say = MagicMock()
-        with patch("paperbot.bot.settings", _make_settings()):
+        with patch("paperscout.scout.settings", _make_settings()):
             registered["message"](
                 event={"text": "status", "channel_type": "im", "ts": "1", "user": "U1"},
                 context={"bot_user_id": "U1"},
@@ -524,7 +524,7 @@ class TestRegisterHandlers:
     def test_message_dm_strips_mention(self, fake_pool):
         registered, _, _ = self._setup(fake_pool)
         say = MagicMock()
-        with patch("paperbot.bot.settings", _make_settings()):
+        with patch("paperscout.scout.settings", _make_settings()):
             registered["message"](
                 event={"text": "<@U1> status", "channel_type": "im", "ts": "1", "user": "U1"},
                 context={"bot_user_id": "U1"},
@@ -578,7 +578,7 @@ class TestRegisterHandlers:
     def test_message_mpim_status_responds(self, fake_pool):
         registered, _, _ = self._setup(fake_pool)
         say = MagicMock()
-        with patch("paperbot.bot.settings", _make_settings()):
+        with patch("paperscout.scout.settings", _make_settings()):
             registered["message"](
                 event={"text": "<@U1> status", "channel_type": "mpim",
                        "ts": "1", "user": "U1"},
@@ -666,11 +666,11 @@ class TestRegisterHandlers:
 class TestHandleVersion:
     def test_version_contains_version_string(self):
         say = MagicMock()
-        with patch("paperbot.__version__", "1.2.3"):
+        with patch("paperscout.__version__", "1.2.3"):
             _handle_version(say, {})
         text = say.call_args[1]["text"]
         assert "1.2.3" in text
-        assert "Paperbot" in text
+        assert "Paperscout" in text
 
     def test_version_forwards_reply_opts(self):
         say = MagicMock()
@@ -701,7 +701,7 @@ class TestUptime:
         say = MagicMock()
         launch = datetime(2026, 3, 16, 10, 0, 0, tzinfo=timezone.utc)
         now = datetime(2026, 3, 16, 13, 30, 0, tzinfo=timezone.utc)
-        with patch("paperbot.bot.datetime") as mock_dt:
+        with patch("paperscout.scout.datetime") as mock_dt:
             mock_dt.now.return_value = now
             mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
             _handle_uptime(launch, say, {})
@@ -750,7 +750,7 @@ class TestDispatchVersionUptime:
             say=say,
         )
         say.assert_called_once()
-        assert "Paperbot" in say.call_args[1]["text"]
+        assert "Paperscout" in say.call_args[1]["text"]
 
     def test_dispatch_uptime(self, fake_pool):
         launch = datetime.now(timezone.utc) - timedelta(hours=2, minutes=15)
@@ -783,12 +783,12 @@ class TestDispatchVersionUptime:
 
 class TestCreateApp:
     def test_create_app_uses_settings(self):
-        from paperbot.bot import create_app
+        from paperscout.scout import create_app
         mock_settings = MagicMock()
         mock_settings.slack_bot_token = "xoxb-test"
         mock_settings.slack_signing_secret = "secret"
-        with patch("paperbot.bot.settings", mock_settings):
-            with patch("paperbot.bot.App") as mock_app_cls:
+        with patch("paperscout.scout.settings", mock_settings):
+            with patch("paperscout.scout.App") as mock_app_cls:
                 create_app()
         mock_app_cls.assert_called_once_with(
             token="xoxb-test",

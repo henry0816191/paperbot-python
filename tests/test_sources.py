@@ -1,4 +1,4 @@
-"""Tests for paperbot.sources."""
+"""Tests for paperscout.sources."""
 from __future__ import annotations
 
 import asyncio
@@ -9,8 +9,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
-from paperbot.models import Paper
-from paperbot.sources import (
+from paperscout.models import Paper
+from paperscout.sources import (
     ISOProber,
     OpenStdEntry,
     ProbeHit,
@@ -20,7 +20,7 @@ from paperbot.sources import (
     _parse_open_std_html,
     scrape_open_std,
 )
-from paperbot.storage import ProbeState, UserWatchlist
+from paperscout.storage import ProbeState, UserWatchlist
 from tests.conftest import SAMPLE_INDEX_DATA, make_test_settings
 
 
@@ -120,7 +120,7 @@ class TestWG21Index:
         index = WG21Index(fake_pool)
         mock_resp = _make_response(200, json_data=SAMPLE_INDEX_DATA)
         mock_client = _make_async_client(get_resp=mock_resp)
-        with patch("paperbot.sources.httpx.AsyncClient") as mock_cls:
+        with patch("paperscout.sources.httpx.AsyncClient") as mock_cls:
             mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
             mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
             result = await index._download()
@@ -130,7 +130,7 @@ class TestWG21Index:
         index = WG21Index(fake_pool)
         mock_resp = _make_response(200, json_data=[1, 2, 3])
         mock_client = _make_async_client(get_resp=mock_resp)
-        with patch("paperbot.sources.httpx.AsyncClient") as mock_cls:
+        with patch("paperscout.sources.httpx.AsyncClient") as mock_cls:
             mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
             mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
             result = await index._download()
@@ -140,7 +140,7 @@ class TestWG21Index:
         index = WG21Index(fake_pool)
         mock_client = AsyncMock()
         mock_client.get = AsyncMock(side_effect=httpx.HTTPError("connect failed"))
-        with patch("paperbot.sources.httpx.AsyncClient") as mock_cls:
+        with patch("paperscout.sources.httpx.AsyncClient") as mock_cls:
             mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
             mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
             result = await index._download()
@@ -279,7 +279,7 @@ class TestFetchPdfText:
 
     async def test_respects_byte_cap(self):
         """stream() should be cut off after _PDF_MAX_BYTES; no crash."""
-        from paperbot.sources import _PDF_MAX_BYTES
+        from paperscout.sources import _PDF_MAX_BYTES
         big_chunk = b"x" * (_PDF_MAX_BYTES + 1)
         # Even though the chunk exceeds the cap, _fetch_pdf_text must not raise.
         # Passing invalid PDF bytes → fitz raises → caught → returns "".
@@ -842,7 +842,7 @@ class TestISOProberProbeOne:
 
         mock_client = AsyncMock()
         mock_client.head = raising_head
-        with patch("paperbot.sources.httpx.AsyncClient") as mock_cls:
+        with patch("paperscout.sources.httpx.AsyncClient") as mock_cls:
             mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
             mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
             with caplog.at_level(logging.DEBUG):
@@ -871,7 +871,7 @@ class TestISOProberProbeOne:
         prober._stats["miss"] = 999  # manually dirty
 
         mock_client = _make_async_client(head_resp=_make_response(404))
-        with patch("paperbot.sources.httpx.AsyncClient") as mock_cls:
+        with patch("paperscout.sources.httpx.AsyncClient") as mock_cls:
             mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
             mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
             await prober.run_cycle()
@@ -914,7 +914,7 @@ class TestISOProberRunCycle:
         mock_client.head = mock_head
         mock_client.get = mock_get
 
-        with patch("paperbot.sources.httpx.AsyncClient") as mock_cls:
+        with patch("paperscout.sources.httpx.AsyncClient") as mock_cls:
             mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
             mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
             hits = await prober.run_cycle()
@@ -949,7 +949,7 @@ class TestISOProberRunCycle:
         mock_client.head = mock_head
         mock_client.get = AsyncMock(return_value=_make_response(404))
 
-        with patch("paperbot.sources.httpx.AsyncClient") as mock_cls:
+        with patch("paperscout.sources.httpx.AsyncClient") as mock_cls:
             mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
             mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
             hits = await prober.run_cycle()
@@ -1009,7 +1009,7 @@ class TestOpenStdScraper:
     async def test_scrape_open_std_success(self):
         mock_resp = _make_response(200, text=OPEN_STD_HTML)
         mock_client = _make_async_client(get_resp=mock_resp)
-        with patch("paperbot.sources.httpx.AsyncClient") as mock_cls:
+        with patch("paperscout.sources.httpx.AsyncClient") as mock_cls:
             mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
             mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
             entries = await scrape_open_std(2024)
@@ -1018,7 +1018,7 @@ class TestOpenStdScraper:
     async def test_scrape_open_std_http_error(self):
         mock_client = AsyncMock()
         mock_client.get = AsyncMock(side_effect=httpx.HTTPError("fail"))
-        with patch("paperbot.sources.httpx.AsyncClient") as mock_cls:
+        with patch("paperscout.sources.httpx.AsyncClient") as mock_cls:
             mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
             mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
             entries = await scrape_open_std(2024)
@@ -1027,7 +1027,7 @@ class TestOpenStdScraper:
     async def test_scrape_open_std_uses_current_year_by_default(self):
         mock_resp = _make_response(200, text="<table></table>")
         mock_client = _make_async_client(get_resp=mock_resp)
-        with patch("paperbot.sources.httpx.AsyncClient") as mock_cls:
+        with patch("paperscout.sources.httpx.AsyncClient") as mock_cls:
             mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
             mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
             await scrape_open_std()
