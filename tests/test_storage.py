@@ -415,3 +415,65 @@ class TestUserWatchlistRawSeed:
         assert paper.number is None
         result = wl.matches_for_users([paper], [])
         assert "U1" not in result
+
+
+# ── FakePool parameter capture ────────────────────────────────────────────────
+
+
+class TestFakePoolParamCapture:
+    """FakePool captures bound parameters; column-value binding errors are detectable."""
+
+    def test_call_log_records_sql_and_params(self, fake_pool):
+        wl = UserWatchlist(fake_pool)
+        wl.add("U1", "alice")
+        calls = fake_pool.calls_matching("INSERT INTO user_watchlist")
+        assert calls
+        assert calls[-1][1]  # params sequence is non-empty
+
+    def test_watchlist_user_id_is_first_param(self, fake_pool):
+        wl = UserWatchlist(fake_pool)
+        wl.add("U1", "alice")
+        fake_pool.assert_param_at("INSERT INTO user_watchlist", 0, "U1")
+
+    def test_watchlist_entry_is_second_param(self, fake_pool):
+        wl = UserWatchlist(fake_pool)
+        wl.add("U1", "alice")
+        fake_pool.assert_param_at("INSERT INTO user_watchlist", 1, "alice")
+
+    def test_watchlist_entry_type_is_third_param(self, fake_pool):
+        wl = UserWatchlist(fake_pool)
+        wl.add("U1", "2300")
+        fake_pool.assert_param_at("INSERT INTO user_watchlist", 2, "paper")
+
+    def test_paper_cache_key_is_first_param(self, fake_pool):
+        cache = PaperCache(fake_pool)
+        cache.write({"a": 1})
+        fake_pool.assert_param_at("INSERT INTO paper_cache", 0, "wg21_index")
+
+    def test_discovered_url_is_first_param(self, fake_pool):
+        state = ProbeState(fake_pool)
+        url = "https://isocpp.org/files/papers/D2300R11.pdf"
+        state.mark_discovered(url, last_modified_ts=42.0)
+        fake_pool.assert_param_at("INSERT INTO discovered_urls", 0, url)
+
+    def test_discovered_last_modified_is_second_param(self, fake_pool):
+        state = ProbeState(fake_pool)
+        url = "https://isocpp.org/files/papers/D2300R11.pdf"
+        state.mark_discovered(url, last_modified_ts=42.0)
+        fake_pool.assert_param_at("INSERT INTO discovered_urls", 1, 42.0)
+
+    def test_assert_param_at_out_of_bounds_raises_assertion_error(self, fake_pool):
+        wl = UserWatchlist(fake_pool)
+        wl.add("U1", "alice")
+        with pytest.raises(AssertionError, match="out of range"):
+            fake_pool.assert_param_at("INSERT INTO user_watchlist", 99, "anything")
+
+    def test_regression_swapped_user_id_and_entry_would_fail(self, fake_pool):
+        """
+        Prove assert_param_at catches binding transposition.
+        This test exercises the FakePool test helper itself, not production code.
+        """
+        wl = UserWatchlist(fake_pool)
+        wl.add("U1", "alice")
+        with pytest.raises(AssertionError):
+            fake_pool.assert_param_at("INSERT INTO user_watchlist", 0, "alice")

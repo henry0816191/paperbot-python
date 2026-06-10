@@ -11,6 +11,7 @@ os.environ.setdefault("SLACK_SIGNING_SECRET", "test-secret")
 
 import json as _json
 import tempfile
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
@@ -35,8 +36,9 @@ class _FakeStore:
 
 
 class _FakeCursor:
-    def __init__(self, store: _FakeStore):
+    def __init__(self, store: _FakeStore, pool: FakePool | None = None):
         self._s = store
+        self._pool = pool
         self.rowcount = 0
         self._row = None
         self._rows: list = []
@@ -48,6 +50,8 @@ class _FakeCursor:
         pass
 
     def execute(self, sql: str, params=()):
+        if self._pool is not None:
+            self._pool.call_log.append((sql, params))
         self._row = None
         self._rows = []
         self.rowcount = 0
@@ -149,7 +153,7 @@ class _FakeCursor:
 
 class _FakeConn:
     def __init__(self, store: _FakeStore, pool: FakePool | None = None):
-        self._cur = _FakeCursor(store)
+        self._cur = _FakeCursor(store, pool)
         self._pool = pool
         self.rollback_called = False
 
@@ -187,6 +191,26 @@ class FakePool:
         self._store = _FakeStore()
         self.fail_on_commit = False
         self.rollback_count = 0
+        self.call_log: list[tuple[str, Sequence]] = []
+
+    def calls_matching(self, sql_fragment: str) -> list[tuple[str, Sequence]]:
+        """Return all recorded (sql, params) pairs whose normalised SQL contains sql_fragment."""
+        frag = " ".join(sql_fragment.split()).upper()
+        return [
+            (sql, params) for sql, params in self.call_log if frag in " ".join(sql.split()).upper()
+        ]
+
+    def assert_param_at(self, sql_fragment: str, position: int, expected) -> None:
+        """Assert that the last call matching sql_fragment has params[position] == expected."""
+        matches = self.calls_matching(sql_fragment)
+        assert matches, f"No SQL call matching {sql_fragment!r} in call_log"
+        _, params = matches[-1]
+        assert 0 <= position < len(params), (
+            f"params has only {len(params)} element(s); position {position} is out of range"
+        )
+        assert params[position] == expected, (
+            f"params[{position}] expected {expected!r}, got {params[position]!r}"
+        )
 
     def getconn(self):
         return _FakeConn(self._store, self)
