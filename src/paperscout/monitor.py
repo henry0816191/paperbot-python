@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
 import logging
 import threading
@@ -456,7 +457,33 @@ class Scheduler:
         self._publish_health_snapshot()
         return result
 
-    async def run_forever(self) -> None:
+    async def _poll_once_or_cancel(self, shutdown_event: asyncio.Event) -> None:
+        """Run ``poll_once`` or cancel promptly when *shutdown_event* is set."""
+        poll_task = asyncio.create_task(self.poll_once())
+        shutdown_task = asyncio.create_task(shutdown_event.wait())
+        try:
+            done, _pending = await asyncio.wait(
+                {poll_task, shutdown_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if shutdown_task in done:
+                poll_task.cancel()
+                await poll_task
+            else:
+                shutdown_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await shutdown_task
+                await poll_task
+        except asyncio.CancelledError:
+            raise
+        finally:
+            for task in (poll_task, shutdown_task):
+                if not task.done():
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+
+    async def run_forever(self, shutdown_event: asyncio.Event | None = None) -> None:
         """Run ``poll_once`` on an interval, with overrun cooldown between cycles."""
         interval = self.cfg.poll_interval_minutes * 60
         cooldown = self.cfg.poll_overrun_cooldown_seconds
@@ -468,10 +495,20 @@ class Scheduler:
             self.cfg.enable_bulk_wg21,
         )
         run_started_wall = time.time()
-        while True:
+        shutdown_requested = False
+        while shutdown_event is None or not shutdown_event.is_set():
             t0 = time.monotonic()
             try:
-                await self.poll_once()
+                if shutdown_event is not None:
+                    await self._poll_once_or_cancel(shutdown_event)
+                else:
+                    await self.poll_once()
+            except asyncio.CancelledError:
+                if shutdown_event is None or not shutdown_event.is_set():
+                    raise
+                log.info("POLL-CANCELLED  poll=%d  reason=shutdown", self._poll_count)
+                shutdown_requested = True
+                break
             except ConfigurationError as exc:
                 log.critical(
                     "POLL-FATAL  failure_category=%s  poll=%d  %s",
@@ -514,6 +551,10 @@ class Scheduler:
                 )
             elapsed = time.monotonic() - t0
 
+            if shutdown_event is not None and shutdown_event.is_set():
+                shutdown_requested = True
+                break
+
             if self.ops_alert_fn:
                 alert_threshold = 2 * interval
                 now_wall = time.time()
@@ -542,4 +583,15 @@ class Scheduler:
                 elapsed,
                 interval,
             )
-            await asyncio.sleep(sleep_for)
+            if shutdown_event is not None:
+                try:
+                    await asyncio.wait_for(shutdown_event.wait(), timeout=sleep_for)
+                    shutdown_requested = True
+                    break
+                except asyncio.TimeoutError:
+                    pass
+            else:
+                await asyncio.sleep(sleep_for)
+
+        if shutdown_requested or (shutdown_event is not None and shutdown_event.is_set()):
+            log.info("SCHEDULER-STOP  reason=shutdown_event")

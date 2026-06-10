@@ -107,6 +107,14 @@ class Settings(BaseSettings):
     mq_circuit_breaker_cooldown_seconds: int = Field(default=60, ge=1)
     mq_max_size: int = Field(default=1000, ge=1)
 
+    # -- Graceful shutdown --
+    shutdown_mq_drain_timeout_seconds: float = Field(default=30.0, ge=0.1)
+    shutdown_thread_join_timeout_seconds: float = Field(default=5.0, ge=0.1)
+    # Set to the container orchestrator's stop/grace period (seconds).
+    # When non-zero, a startup warning is emitted if the combined shutdown budget
+    # (mq_drain + 2 × thread_join) meets or exceeds this value.
+    stop_grace_period_seconds: float = Field(default=0.0, ge=0.0)
+
     @model_validator(mode="after")
     def _require_slack_credentials_unless_testing(self) -> Settings:
         """Slack tokens must be set for real runs; pytest sets ``_PAPERSCOUT_TESTING=1``."""

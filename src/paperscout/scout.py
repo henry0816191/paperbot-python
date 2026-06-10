@@ -33,6 +33,8 @@ def create_app() -> App:
 
 SLACK_MAX_TEXT = 3000
 
+_MQ_SENTINEL = object()
+
 
 # ── Message Queue ─────────────────────────────────────────────────────────────
 
@@ -150,9 +152,7 @@ class MessageQueue:
 
     def __init__(self, app: App):
         self._app = app
-        self._q: queue.Queue[tuple[str, str, dict]] = queue.Queue(
-            maxsize=settings.mq_max_size,
-        )
+        self._q: queue.Queue[Any] = queue.Queue(maxsize=settings.mq_max_size)
         self._last_send: dict[str, float] = {}
         self._lock = threading.Lock()
         self._queue_lock = threading.Lock()
@@ -163,12 +163,55 @@ class MessageQueue:
             cooldown_seconds=settings.mq_circuit_breaker_cooldown_seconds,
         )
         self._warned_high_water = False
+        self._stop_requested = threading.Event()
+        self._drain_sent_count = 0
+        self._drain_sent_lock = threading.Lock()
 
     def start(self) -> None:
         """Start the background sender thread."""
+        if self._thread is not None and self._thread.is_alive():
+            return
         self._thread = threading.Thread(target=self._run, daemon=True, name="mq-sender")
         self._thread.start()
         log.info("MessageQueue  started")
+
+    def stop(self) -> None:
+        """Signal the sender thread to exit after draining queued messages."""
+        if self._stop_requested.is_set():
+            return
+        with self._drain_sent_lock:
+            self._drain_sent_count = 0
+        self._stop_requested.set()
+        self._put_shutdown_sentinel()
+
+    def join(self, timeout: float | None = None) -> bool:
+        """Wait for the sender thread. Return True if still alive (timed out)."""
+        if self._thread is None:
+            return False
+        self._thread.join(timeout)
+        return self._thread.is_alive()
+
+    def drain(self, timeout: float | None = None) -> int:
+        """Stop the queue and block until drained or *timeout* expires.
+
+        Returns the number of messages successfully sent during drain.
+        """
+        if not self._stop_requested.is_set():
+            self.stop()
+        drain_timeout = (
+            timeout if timeout is not None else settings.shutdown_mq_drain_timeout_seconds
+        )
+        self.join(drain_timeout)
+        with self._drain_sent_lock:
+            return self._drain_sent_count
+
+    def _put_shutdown_sentinel(self) -> None:
+        """Enqueue shutdown sentinel, bypassing circuit breaker and drop-oldest."""
+        with self._queue_lock:
+            try:
+                self._q.put_nowait(_MQ_SENTINEL)
+            except queue.Full:
+                pass  # _stop_requested still lets _run() exit via queue.Empty + flag
 
     def depth(self) -> int:
         """Approximate number of messages waiting to send."""
@@ -190,6 +233,13 @@ class MessageQueue:
 
     def enqueue(self, channel: str, text: str, **kwargs) -> bool:
         """Queue a ``chat.postMessage``; return False when the circuit breaker rejects."""
+        if self._stop_requested.is_set():
+            log.warning(
+                "MQ  enqueue-rejected  shutdown  %s  %s",
+                _redact_channel(channel),
+                _payload_meta(text, kwargs),
+            )
+            return False
         if not self._breaker.allow_send():
             log.warning(
                 "MQ  enqueue-rejected  circuit=open  %s  %s",
@@ -201,21 +251,40 @@ class MessageQueue:
         item = (channel, text, kwargs)
         max_size = settings.mq_max_size
         with self._queue_lock:
+            if self._stop_requested.is_set():
+                log.warning(
+                    "MQ  enqueue-rejected  shutdown  %s  %s",
+                    _redact_channel(channel),
+                    _payload_meta(text, kwargs),
+                )
+                return False
             while True:
                 try:
                     self._q.put_nowait(item)
                     break
                 except queue.Full:
                     try:
-                        dropped_ch, dropped_text, dropped_kwargs = self._q.get_nowait()
-                        log.warning(
-                            "MQ  drop-oldest  %s  %s",
-                            _redact_channel(dropped_ch),
-                            _payload_meta(dropped_text, dropped_kwargs),
-                        )
+                        dropped = self._q.get_nowait()
                     except queue.Empty:
                         # Consumer may have taken an item between Full and get_nowait; retry put.
                         continue
+                    if dropped is _MQ_SENTINEL:
+                        try:
+                            self._q.put_nowait(_MQ_SENTINEL)
+                        except queue.Full:
+                            pass
+                        log.warning(
+                            "MQ  enqueue-rejected  shutdown  %s  %s",
+                            _redact_channel(channel),
+                            _payload_meta(text, kwargs),
+                        )
+                        return False
+                    dropped_ch, dropped_text, dropped_kwargs = dropped
+                    log.warning(
+                        "MQ  drop-oldest  %s  %s",
+                        _redact_channel(dropped_ch),
+                        _payload_meta(dropped_text, dropped_kwargs),
+                    )
             if max_size > 0:
                 depth = self._q.qsize()
                 high = 0.8 * max_size
@@ -233,12 +302,20 @@ class MessageQueue:
         return True
 
     def _run(self) -> None:
+        """Background sender loop; exits on sentinel or when stop is requested."""
         while True:
             try:
-                channel, text, kwargs = self._q.get(timeout=1)
+                item = self._q.get(timeout=1)
             except queue.Empty:
+                if self._stop_requested.is_set():
+                    break
                 continue
 
+            if item is _MQ_SENTINEL:
+                self._q.task_done()
+                break
+
+            channel, text, kwargs = item
             self._throttle(channel)
             self._send_with_retry(channel, text, kwargs)
             self._q.task_done()
@@ -268,7 +345,7 @@ class MessageQueue:
         )
 
     def _send_with_retry(self, channel: str, text: str, kwargs: dict) -> None:
-        if not self._breaker.allow_send():
+        if not self._stop_requested.is_set() and not self._breaker.allow_send():
             self._dead_letter(channel, text, reason="circuit_open", kwargs=kwargs)
             return
 
@@ -285,6 +362,9 @@ class MessageQueue:
                 with self._lock:
                     self._last_send[channel] = time.monotonic()
                 self._breaker.record_success()
+                if self._stop_requested.is_set():
+                    with self._drain_sent_lock:
+                        self._drain_sent_count += 1
                 return
             except SlackApiError as exc:
                 if exc.response.status_code == 429:

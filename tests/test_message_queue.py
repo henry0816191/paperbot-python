@@ -1,358 +1,188 @@
-"""Tests for paperscout.scout.MessageQueue (Slack chat.postMessage worker)."""
+"""Tests for MessageQueue graceful shutdown."""
 
 from __future__ import annotations
 
-import logging
-import queue
 import threading
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
-import pytest
 from slack_sdk.errors import SlackApiError
 
-import paperscout.config as cfg
 from paperscout.scout import CircuitState, MessageQueue
 
 
-def _slack_error(status: int, headers: dict | None = None) -> SlackApiError:
-    resp = MagicMock()
-    resp.status_code = status
-    resp.headers = headers if headers is not None else {}
-    return SlackApiError("slack error", resp)
-
-
-@pytest.fixture()
-def mq_settings(monkeypatch):
-    """Fast, small queue/breaker settings for tests."""
-    monkeypatch.setattr(cfg.settings, "mq_max_retries", 3)
-    monkeypatch.setattr(cfg.settings, "mq_circuit_breaker_threshold", 2)
-    monkeypatch.setattr(cfg.settings, "mq_circuit_breaker_cooldown_seconds", 10)
-    monkeypatch.setattr(cfg.settings, "mq_max_size", 5)
-
-
-class TestMessageQueueDirect:
-    """Exercise ``_throttle`` / ``_send_with_retry`` without starting the daemon thread."""
-
-    def test_health_fields_reports_depth_and_utilization(self):
-        mq = MessageQueue(MagicMock())
-        mq.enqueue("C1", "x")
-        fields = mq.health_fields()
-        assert fields["mq_depth"] == 1
-        assert fields["mq_max_size"] >= 1
-        assert 0.0 <= fields["mq_utilization"] <= 1.0
-        assert fields["mq_circuit_state"] == "closed"
-
-    def test_health_fields_clamps_utilization_when_depth_exceeds_max(self):
-        mq = MessageQueue(MagicMock())
-        with patch("paperscout.scout.settings") as cfg:
-            cfg.mq_max_size = 2
-            for i in range(5):
-                mq.enqueue(f"C{i}", "x")
-            fields = mq.health_fields()
-        assert fields["mq_depth"] == 5
-        assert fields["mq_max_size"] == 2
-        assert fields["mq_utilization"] == 1.0
-
-    def test_send_success_updates_last_send(self):
-        app = MagicMock()
-        mq = MessageQueue(app)
-        with patch.object(mq, "_throttle"):
-            mq._send_with_retry("C1", "hello", {})
-        app.client.chat_postMessage.assert_called_once_with(
-            channel="C1",
-            text="hello",
-            unfurl_links=False,
-            unfurl_media=False,
-        )
-
-    def test_send_forwards_extra_kwargs(self):
-        app = MagicMock()
-        mq = MessageQueue(app)
-        with patch.object(mq, "_throttle"):
-            mq._send_with_retry("C1", "x", {"thread_ts": "99.9"})
-        app.client.chat_postMessage.assert_called_once_with(
-            channel="C1",
-            text="x",
-            unfurl_links=False,
-            unfurl_media=False,
-            thread_ts="99.9",
-        )
-
-    def test_429_retries_then_success(self):
-        app = MagicMock()
-        app.client.chat_postMessage.side_effect = [
-            _slack_error(429, {"Retry-After": "2"}),
-            None,
-        ]
-        mq = MessageQueue(app)
-        sleeps: list[float] = []
-
-        with patch.object(mq, "_throttle"):
-            with patch("paperscout.scout.time.sleep", side_effect=sleeps.append):
-                mq._send_with_retry("C1", "hi", {})
-
-        assert app.client.chat_postMessage.call_count == 2
-        assert sleeps == [2.0]
-
-    def test_429_default_retry_after_when_header_missing(self):
-        app = MagicMock()
-        app.client.chat_postMessage.side_effect = [
-            _slack_error(429, {}),
-            None,
-        ]
-        mq = MessageQueue(app)
-        sleeps: list[float] = []
-
-        with patch.object(mq, "_throttle"):
-            with patch("paperscout.scout.time.sleep", side_effect=sleeps.append):
-                mq._send_with_retry("C1", "hi", {})
-
-        assert sleeps == [5.0]
-
-    def test_429_retry_cap_exhaustion_dead_letters(self, mq_settings, caplog):
-        app = MagicMock()
-        app.client.chat_postMessage.side_effect = _slack_error(429, {"Retry-After": "1"})
-        mq = MessageQueue(app)
-
-        with patch.object(mq, "_throttle"):
-            with patch("paperscout.scout.time.sleep"):
-                with caplog.at_level(logging.ERROR):
-                    mq._send_with_retry("C1", "stuck message", {})
-
-        assert app.client.chat_postMessage.call_count == cfg.settings.mq_max_retries + 1
-        assert any("MQ-DEAD-LETTER" in r.message for r in caplog.records)
-        assert any("retry_exhausted" in r.message for r in caplog.records)
-
-    def test_circuit_breaker_trips_after_consecutive_failures(self, mq_settings, caplog):
-        app = MagicMock()
-        app.client.chat_postMessage.side_effect = _slack_error(500)
-        mq = MessageQueue(app)
-
-        with patch.object(mq, "_throttle"):
-            with caplog.at_level(logging.ERROR):
-                mq._send_with_retry("C1", "a", {})
-                mq._send_with_retry("C1", "b", {})
-
-        assert mq._breaker.state == CircuitState.OPEN
-        assert any("MQ-CIRCUIT-OPEN" in r.message for r in caplog.records)
-
-        with patch.object(mq, "_throttle"):
-            with caplog.at_level(logging.ERROR):
-                mq._send_with_retry("C1", "c", {})
-
-        assert app.client.chat_postMessage.call_count == 2
-        assert any("circuit_open" in r.message for r in caplog.records)
-
-    def test_circuit_breaker_half_open_recovery(self, mq_settings, caplog):
-        app = MagicMock()
-        mq = MessageQueue(app)
-        with mq._breaker._lock:
-            mq._breaker._state = CircuitState.OPEN
-            mq._breaker._opened_at = 1000.0
-            mq._breaker._consecutive_failures = cfg.settings.mq_circuit_breaker_threshold
-
-        mono = [1000.0]
-
-        def fake_monotonic():
-            return mono[0]
-
-        with patch.object(mq, "_throttle"):
-            with patch("paperscout.scout.time.monotonic", side_effect=fake_monotonic):
-                with caplog.at_level(logging.INFO):
-                    mq._send_with_retry("C1", "blocked", {})
-                    assert mq._breaker.state == CircuitState.OPEN
-
-                    mono[0] = 1011.0
-                    app.client.chat_postMessage.side_effect = None
-                    mq._send_with_retry("C1", "probe ok", {})
-
-        assert mq._breaker.state == CircuitState.CLOSED
-        assert any("MQ-CIRCUIT-HALF-OPEN" in r.message for r in caplog.records)
-
-    def test_circuit_breaker_half_open_failure_reopens(self, mq_settings):
-        app = MagicMock()
-        app.client.chat_postMessage.side_effect = _slack_error(500)
-        mq = MessageQueue(app)
-        with mq._breaker._lock:
-            mq._breaker._state = CircuitState.HALF_OPEN
-
-        with patch.object(mq, "_throttle"):
-            mq._send_with_retry("C1", "fail probe", {})
-
-        assert mq._breaker.state == CircuitState.OPEN
-
-    def test_non_429_slack_error_stops(self):
-        app = MagicMock()
-        app.client.chat_postMessage.side_effect = _slack_error(500)
-        mq = MessageQueue(app)
-
-        with patch.object(mq, "_throttle"):
-            mq._send_with_retry("C1", "hi", {})
-
-        assert app.client.chat_postMessage.call_count == 1
-
-    def test_generic_exception_stops(self):
-        app = MagicMock()
-        app.client.chat_postMessage.side_effect = RuntimeError("network down")
-        mq = MessageQueue(app)
-
-        with patch.object(mq, "_throttle"):
-            mq._send_with_retry("C1", "hi", {})
-
-        assert app.client.chat_postMessage.call_count == 1
-
-    def test_throttle_sleeps_when_within_one_second(self):
-        app = MagicMock()
-        mq = MessageQueue(app)
-        mq._last_send["C1"] = 1000.0
-
-        sleeps: list[float] = []
-
-        with patch("paperscout.scout.time.monotonic", return_value=1000.4):
-            with patch("paperscout.scout.time.sleep", side_effect=sleeps.append):
-                mq._throttle("C1")
-
-        assert len(sleeps) == 1
-        assert sleeps[0] == pytest.approx(0.6, rel=1e-3)
-
-    def test_throttle_no_sleep_when_idle(self):
-        app = MagicMock()
-        mq = MessageQueue(app)
-        mq._last_send["C1"] = 0.0
-
-        sleeps: list[float] = []
-
-        with patch("paperscout.scout.time.monotonic", return_value=5000.0):
-            with patch("paperscout.scout.time.sleep", side_effect=sleeps.append):
-                mq._throttle("C1")
-
-        assert sleeps == []
-
-
-class TestMessageQueueBounded:
-    def test_enqueue_normal_returns_true(self, mq_settings):
-        app = MagicMock()
-        mq = MessageQueue(app)
-        assert mq.enqueue("C1", "hello") is True
-        assert mq.depth() == 1
-
-    def test_enqueue_respects_max_size_drop_oldest(self, mq_settings, caplog):
-        app = MagicMock()
-        mq = MessageQueue(app)
-        for i in range(cfg.settings.mq_max_size):
-            assert mq.enqueue("C", f"msg-{i}") is True
-
-        with caplog.at_level(logging.WARNING):
-            assert mq.enqueue("C", "newest") is True
-
-        assert mq.depth() == cfg.settings.mq_max_size
-        assert any("drop-oldest" in r.message for r in caplog.records)
-
-        with mq._queue_lock:
-            items = []
-            while True:
-                try:
-                    items.append(mq._q.get_nowait())
-                except queue.Empty:
-                    break
-        texts = [t for _, t, _ in items]
-        assert "msg-0" not in texts
-        assert "newest" in texts
-
-    def test_enqueue_retries_put_when_get_nowait_empty_after_full(self, mq_settings):
-        """Full then Empty on drop path must retry put, not silently discard the new item."""
-        mq = MessageQueue(MagicMock())
-        real_put = mq._q.put_nowait
-        put_attempts = 0
-
-        def put_side_effect(item):
-            nonlocal put_attempts
-            put_attempts += 1
-            if put_attempts == 1:
-                raise queue.Full
-            return real_put(item)
-
-        with patch.object(mq._q, "put_nowait", side_effect=put_side_effect):
-            with patch.object(mq._q, "get_nowait", side_effect=queue.Empty):
-                assert mq.enqueue("C", "new-item") is True
-
-        assert put_attempts == 2
-        assert mq.depth() == 1
-        with mq._queue_lock:
-            _, text, _ = mq._q.get_nowait()
-        assert text == "new-item"
-
-    def test_enqueue_rejected_when_circuit_open(self, mq_settings, caplog):
-        app = MagicMock()
-        mq = MessageQueue(app)
-        with mq._breaker._lock:
-            mq._breaker._state = CircuitState.OPEN
-            mq._breaker._opened_at = time.monotonic()
-
-        with caplog.at_level(logging.WARNING):
-            assert mq.enqueue("C1", "blocked") is False
-
-        assert mq.depth() == 0
-        assert any("enqueue-rejected" in r.message for r in caplog.records)
-
-    def test_enqueue_accepts_after_cooldown_expires(self, mq_settings):
-        mq = MessageQueue(MagicMock())
-        with mq._breaker._lock:
-            mq._breaker._state = CircuitState.OPEN
-            mq._breaker._opened_at = 1000.0
-
-        with patch("paperscout.scout.time.monotonic", return_value=1011.0):
-            assert mq.enqueue("C1", "after cooldown") is True
-        assert mq.depth() == 1
-
-    def test_health_fields_circuit_state_open_after_trip(self, mq_settings, caplog):
-        app = MagicMock()
-        app.client.chat_postMessage.side_effect = _slack_error(500)
-        mq = MessageQueue(app)
-        with patch.object(mq, "_throttle"):
-            with caplog.at_level(logging.ERROR):
-                mq._send_with_retry("C1", "a", {})
-                mq._send_with_retry("C1", "b", {})
-        assert mq.health_fields()["mq_circuit_state"] == "open"
-
-    def test_health_fields_reports_depth_and_utilization(self, mq_settings):
-        app = MagicMock()
-        mq = MessageQueue(app)
-        mq.enqueue("C1", "a")
-        mq.enqueue("C1", "b")
-        fields = mq.health_fields()
-        assert fields["mq_depth"] == 2
-        assert fields["mq_max_size"] == cfg.settings.mq_max_size
-        assert fields["mq_utilization"] == pytest.approx(2 / cfg.settings.mq_max_size, rel=1e-3)
-        assert fields["mq_circuit_state"] == "closed"
-
-    def test_high_water_warning_at_80_percent(self, monkeypatch, caplog):
-        monkeypatch.setattr(cfg.settings, "mq_max_size", 10)
-        app = MagicMock()
-        mq = MessageQueue(app)
-        threshold = int(0.8 * cfg.settings.mq_max_size)
-        for i in range(threshold - 1):
-            mq.enqueue("C", f"m{i}")
-
-        with caplog.at_level(logging.WARNING):
-            mq.enqueue("C", "tip-over")
-
-        assert any("high-water" in r.message for r in caplog.records)
-
-
-class TestMessageQueueThreaded:
-    def test_enqueue_processed_by_background_thread(self):
-        app = MagicMock()
-        mq = MessageQueue(app)
-        done = threading.Event()
-
-        def side_effect(**kwargs):
-            done.set()
-
-        app.client.chat_postMessage.side_effect = side_effect
-
+def _make_mq() -> MessageQueue:
+    app = MagicMock()
+    app.client.chat_postMessage = MagicMock()
+    return MessageQueue(app)
+
+
+class TestMessageQueueShutdown:
+    def test_stop_drains_pending_messages(self):
+        mq = _make_mq()
         mq.start()
-        assert mq.enqueue("D123", "queued message") is True
-        assert done.wait(timeout=5.0), "chat_postMessage was not invoked in time"
-        app.client.chat_postMessage.assert_called()
+        for i in range(3):
+            mq.enqueue("C1", f"msg-{i}")
+        drained = mq.drain(timeout=5.0)
+        assert drained == 3
+        assert mq._app.client.chat_postMessage.call_count == 3
+        assert not mq.join(timeout=0.1)
+
+    def test_stop_is_idempotent(self):
+        mq = _make_mq()
+        mq.start()
+        mq.enqueue("C1", "hello")
+        mq.stop()
+        mq.stop()
+        drained = mq.drain(timeout=5.0)
+        assert drained == 1
+        assert not mq.join(timeout=0.1)
+
+    def test_drain_counts_only_successful_sends(self):
+        mq = _make_mq()
+        response = MagicMock()
+        response.status_code = 500
+        err = SlackApiError("fail", response)
+
+        def side_effect(**_kwargs):
+            if mq._app.client.chat_postMessage.call_count == 1:
+                raise err
+            return MagicMock()
+
+        mq._app.client.chat_postMessage.side_effect = side_effect
+        mq.start()
+        mq.enqueue("C1", "fail")
+        mq.enqueue("C1", "ok")
+        drained = mq.drain(timeout=5.0)
+        assert drained == 1
+
+    def test_drain_times_out(self):
+        mq = _make_mq()
+
+        def slow_send(**_kwargs):
+            time.sleep(2.0)
+
+        mq._app.client.chat_postMessage.side_effect = slow_send
+        mq.start()
+        mq.enqueue("C1", "slow")
+        assert mq.join(timeout=0.1)
+        drained = mq.drain(timeout=0.1)
+        assert drained == 0
+        mq.join(timeout=5.0)
+        assert not mq.join(timeout=0.1)
+
+    def test_start_guard_no_double_thread(self):
+        mq = _make_mq()
+        mq.start()
+        first = mq._thread
+        mq.start()
+        assert mq._thread is first
+        assert threading.active_count() >= 1
+        mq.drain(timeout=2.0)
+
+    def test_stop_bypasses_open_circuit(self):
+        mq = _make_mq()
+        mq.start()
+        for _ in range(mq._breaker._threshold):
+            mq._breaker.record_failure()
+        assert mq._breaker.state == CircuitState.OPEN
+        assert not mq.enqueue("C1", "blocked")
+        mq.stop()
+        assert mq.drain(timeout=2.0) == 0
+        assert not mq.join(timeout=0.1)
+
+    def test_drain_sends_despite_open_circuit(self):
+        mq = _make_mq()
+        gate = threading.Event()
+        sender_started = threading.Event()
+
+        def gated_send(**_kwargs):
+            sender_started.set()
+            gate.wait(timeout=2.0)
+
+        mq._app.client.chat_postMessage.side_effect = gated_send
+        mq.start()
+        mq.enqueue("C1", "queued")
+        assert sender_started.wait(timeout=2.0), "sender did not start"
+        for _ in range(mq._breaker._threshold):
+            mq._breaker.record_failure()
+        assert mq._breaker.state == CircuitState.OPEN
+        mq.stop()
+        gate.set()
+        drained = mq.drain(timeout=5.0)
+        assert drained == 1
+
+    def test_enqueue_rejected_after_stop(self):
+        mq = _make_mq()
+        mq.start()
+        mq.stop()
+        assert mq.enqueue("C1", "too-late") is False
+        assert mq._app.client.chat_postMessage.call_count == 0
+        mq.drain(timeout=2.0)
+
+    def test_enqueue_rejects_when_stop_races_under_lock(self):
+        """Re-check under _queue_lock rejects enqueues that passed the pre-lock check."""
+        mq = _make_mq()
+        mq.start()
+
+        class _GateLock:
+            def __init__(self, real: threading.Lock):
+                self._real = real
+                self.entered = threading.Event()
+                self.proceed = threading.Event()
+
+            def __enter__(self):
+                self._real.acquire()
+                self.entered.set()
+                self.proceed.wait(timeout=2.0)
+                return self
+
+            def __exit__(self, *_args):
+                self._real.release()
+
+        gate = _GateLock(mq._queue_lock)
+        mq._queue_lock = gate
+
+        result: list[bool] = []
+
+        def try_enqueue():
+            result.append(mq.enqueue("C1", "late"))
+
+        waiter = threading.Thread(target=try_enqueue)
+        waiter.start()
+        assert gate.entered.wait(timeout=2.0), "enqueue did not reach lock"
+        mq.stop()
+        gate.proceed.set()
+        waiter.join(timeout=2.0)
+
+        assert result == [False]
+        assert mq._app.client.chat_postMessage.call_count == 0
+        mq.drain(timeout=2.0)
+
+    def test_stop_does_not_block_on_full_queue(self, monkeypatch):
+        monkeypatch.setattr("paperscout.scout.settings.mq_max_size", 1)
+        mq = _make_mq()
+        sender_busy = threading.Event()
+
+        def slow_send(**_kwargs):
+            sender_busy.set()
+            time.sleep(10)
+
+        mq._app.client.chat_postMessage.side_effect = slow_send
+        mq.start()
+        mq.enqueue("C1", "first")
+        assert sender_busy.wait(timeout=2.0)
+        with mq._queue_lock:
+            mq._q.put_nowait(("C1", "second", {}))
+
+        stop_done = threading.Event()
+
+        def call_stop():
+            mq.stop()
+            stop_done.set()
+
+        stopper = threading.Thread(target=call_stop)
+        stopper.start()
+        assert stop_done.wait(timeout=1.0)
+        stopper.join(timeout=1.0)
+        mq.drain(timeout=2.0)

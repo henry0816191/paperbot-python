@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -21,6 +22,13 @@ from paperscout.monitor import (
 from paperscout.sources import ISOProber, WG21Index
 from paperscout.storage import ProbeState, UserWatchlist
 from tests.conftest import make_test_settings
+
+
+def _wait_for_timeout(awaitable, timeout=None):
+    """Sync mock for asyncio.wait_for that times out immediately without orphaning coroutines."""
+    if hasattr(awaitable, "close"):
+        awaitable.close()
+    raise asyncio.TimeoutError
 
 
 def _recent_hit(**kwargs) -> ProbeHit:
@@ -457,23 +465,37 @@ class TestScheduler:
         assert seed_result.probe_hits == [hit]
         assert state.is_discovered(hit.url)
 
-    async def test_run_forever_calls_poll_and_breaks_on_cancel(self, fake_pool):
+    async def test_run_forever_reraises_cancelled_error_without_shutdown_event(self, fake_pool):
         scheduler, _, _, _, _ = _make_scheduler(fake_pool)
-        call_count = 0
 
         async def mock_poll_once():
-            nonlocal call_count
-            call_count += 1
             raise asyncio.CancelledError()
 
         scheduler.poll_once = mock_poll_once
         with patch("asyncio.sleep", AsyncMock()):
             with pytest.raises(asyncio.CancelledError):
                 await scheduler.run_forever()
+
+    async def test_run_forever_calls_poll_and_breaks_on_shutdown(self, fake_pool):
+        scheduler, _, _, _, _ = _make_scheduler(fake_pool)
+        shutdown_event = asyncio.Event()
+        call_count = 0
+
+        async def mock_poll_once():
+            nonlocal call_count
+            call_count += 1
+            shutdown_event.set()
+
+        scheduler.poll_once = mock_poll_once
+        with patch("asyncio.sleep", AsyncMock()):
+            await scheduler.run_forever(shutdown_event)
         assert call_count == 1
 
     async def test_run_forever_continues_after_poll_exception(self, fake_pool):
-        scheduler, _, _, _, _ = _make_scheduler(fake_pool, poll_interval_minutes=0)
+        scheduler, _, _, _, _ = _make_scheduler(
+            fake_pool, poll_interval_minutes=0, poll_overrun_cooldown_seconds=0
+        )
+        shutdown_event = asyncio.Event()
         call_count = 0
 
         async def mock_poll_once():
@@ -481,16 +503,18 @@ class TestScheduler:
             call_count += 1
             if call_count == 1:
                 raise RuntimeError("poll failed")
-            raise asyncio.CancelledError()
+            shutdown_event.set()
 
         scheduler.poll_once = mock_poll_once
-        with patch("asyncio.sleep", AsyncMock()):
-            with pytest.raises(asyncio.CancelledError):
-                await scheduler.run_forever()
+        with patch("asyncio.wait_for", _wait_for_timeout):
+            await scheduler.run_forever(shutdown_event)
         assert call_count == 2
 
     async def test_run_forever_emits_timeout_failure_category(self, fake_pool, caplog):
-        scheduler, _, _, _, _ = _make_scheduler(fake_pool, poll_interval_minutes=0)
+        scheduler, _, _, _, _ = _make_scheduler(
+            fake_pool, poll_interval_minutes=0, poll_overrun_cooldown_seconds=0
+        )
+        shutdown_event = asyncio.Event()
         call_count = 0
 
         async def mock_poll_once():
@@ -498,18 +522,20 @@ class TestScheduler:
             call_count += 1
             if call_count == 1:
                 raise httpx.TimeoutException("boom", request=MagicMock())
-            raise asyncio.CancelledError()
+            shutdown_event.set()
 
         scheduler.poll_once = mock_poll_once
         with caplog.at_level(logging.ERROR, logger="paperscout.monitor"):
-            with patch("asyncio.sleep", AsyncMock()):
-                with pytest.raises(asyncio.CancelledError):
-                    await scheduler.run_forever()
+            with patch("asyncio.wait_for", _wait_for_timeout):
+                await scheduler.run_forever(shutdown_event)
         assert "failure_category=TIMEOUT" in caplog.text
         assert call_count == 2
 
     async def test_run_forever_emits_network_failure_category(self, fake_pool, caplog):
-        scheduler, _, _, _, _ = _make_scheduler(fake_pool, poll_interval_minutes=0)
+        scheduler, _, _, _, _ = _make_scheduler(
+            fake_pool, poll_interval_minutes=0, poll_overrun_cooldown_seconds=0
+        )
+        shutdown_event = asyncio.Event()
         call_count = 0
 
         async def mock_poll_once():
@@ -517,15 +543,58 @@ class TestScheduler:
             call_count += 1
             if call_count == 1:
                 raise httpx.ConnectError("no route", request=MagicMock())
-            raise asyncio.CancelledError()
+            shutdown_event.set()
 
         scheduler.poll_once = mock_poll_once
         with caplog.at_level(logging.ERROR, logger="paperscout.monitor"):
-            with patch("asyncio.sleep", AsyncMock()):
-                with pytest.raises(asyncio.CancelledError):
-                    await scheduler.run_forever()
+            with patch("asyncio.wait_for", _wait_for_timeout):
+                await scheduler.run_forever(shutdown_event)
         assert "failure_category=NETWORK" in caplog.text
         assert call_count == 2
+
+    async def test_run_forever_exits_on_shutdown_event_during_sleep(self, fake_pool):
+        scheduler, _, _, _, _ = _make_scheduler(fake_pool, poll_interval_minutes=30)
+        shutdown_event = asyncio.Event()
+
+        async def mock_poll_once():
+            shutdown_event.set()
+
+        scheduler.poll_once = mock_poll_once
+        with patch("asyncio.sleep", AsyncMock()) as sleep_m:
+            await scheduler.run_forever(shutdown_event)
+        sleep_m.assert_not_called()
+
+    async def test_run_forever_exits_when_event_set_before_first_poll(self, fake_pool):
+        scheduler, _, _, _, _ = _make_scheduler(fake_pool)
+        shutdown_event = asyncio.Event()
+        shutdown_event.set()
+        scheduler.poll_once = AsyncMock()
+        await scheduler.run_forever(shutdown_event)
+        scheduler.poll_once.assert_not_called()
+
+    async def test_run_forever_cancels_in_flight_poll(self, fake_pool, caplog):
+        scheduler, _, _, _, _ = _make_scheduler(fake_pool)
+        shutdown_event = asyncio.Event()
+        poll_started = asyncio.Event()
+
+        async def slow_poll_once():
+            poll_started.set()
+            await asyncio.Event().wait()
+
+        async def request_shutdown():
+            await poll_started.wait()
+            shutdown_event.set()
+
+        scheduler.poll_once = slow_poll_once
+        stopper = asyncio.create_task(request_shutdown())
+        try:
+            with caplog.at_level(logging.INFO, logger="paperscout.monitor"):
+                await scheduler.run_forever(shutdown_event)
+        finally:
+            stopper.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await stopper
+        assert "POLL-CANCELLED" in caplog.text
 
     async def test_failed_probe_cycle_does_not_advance_last_successful_poll_normal_path(
         self, fake_pool
@@ -597,6 +666,7 @@ class TestScheduler:
         scheduler, _, _, _, _ = _make_scheduler(
             fake_pool, poll_interval_minutes=30, poll_overrun_cooldown_seconds=300
         )
+        shutdown_event = asyncio.Event()
         call_count = 0
         slept: list[float] = []
 
@@ -604,17 +674,20 @@ class TestScheduler:
             nonlocal call_count
             call_count += 1
             if call_count >= 2:
-                raise asyncio.CancelledError()
+                shutdown_event.set()
 
-        async def capture_sleep(duration: float):
-            slept.append(duration)
+        def capture_wait_for(awaitable, timeout=None):
+            if hasattr(awaitable, "close"):
+                awaitable.close()
+            if timeout is not None:
+                slept.append(timeout)
+            raise asyncio.TimeoutError
 
         with patch("paperscout.monitor.time") as mock_time:
-            mock_time.monotonic.side_effect = [0.0, 360.0, 0.0]
+            mock_time.monotonic.side_effect = [0.0, 360.0, 0.0, 1.0]
             scheduler.poll_once = mock_poll_once
-            with patch("asyncio.sleep", capture_sleep):
-                with pytest.raises(asyncio.CancelledError):
-                    await scheduler.run_forever()
+            with patch("asyncio.wait_for", side_effect=capture_wait_for):
+                await scheduler.run_forever(shutdown_event)
 
         assert len(slept) == 1
         assert slept[0] == pytest.approx(1440.0)
@@ -623,6 +696,7 @@ class TestScheduler:
         scheduler, _, _, _, _ = _make_scheduler(
             fake_pool, poll_interval_minutes=30, poll_overrun_cooldown_seconds=300
         )
+        shutdown_event = asyncio.Event()
         call_count = 0
         slept: list[float] = []
 
@@ -630,17 +704,20 @@ class TestScheduler:
             nonlocal call_count
             call_count += 1
             if call_count >= 2:
-                raise asyncio.CancelledError()
+                shutdown_event.set()
 
-        async def capture_sleep(duration: float):
-            slept.append(duration)
+        def capture_wait_for(awaitable, timeout=None):
+            if hasattr(awaitable, "close"):
+                awaitable.close()
+            if timeout is not None:
+                slept.append(timeout)
+            raise asyncio.TimeoutError
 
         with patch("paperscout.monitor.time") as mock_time:
-            mock_time.monotonic.side_effect = [0.0, 2000.0, 0.0]
+            mock_time.monotonic.side_effect = [0.0, 2000.0, 0.0, 1.0]
             scheduler.poll_once = mock_poll_once
-            with patch("asyncio.sleep", capture_sleep):
-                with pytest.raises(asyncio.CancelledError):
-                    await scheduler.run_forever()
+            with patch("asyncio.wait_for", side_effect=capture_wait_for):
+                await scheduler.run_forever(shutdown_event)
 
         assert len(slept) == 1
         assert slept[0] == pytest.approx(300.0)

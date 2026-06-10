@@ -10,6 +10,9 @@ services:
     env_file: .env
     environment:
       HEALTH_BIND_HOST: "0.0.0.0"
+      # Passed into the container so the startup budget check can compare it
+      # against the configured shutdown timeouts.  Must match stop_grace_period.
+      STOP_GRACE_PERIOD_SECONDS: "${STOP_GRACE_PERIOD_SECONDS:-45}"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     logging:
@@ -17,4 +20,11 @@ services:
       options:
         max-size: "10m"
         max-file: "5"
+    # Must exceed the combined shutdown budget:
+    # SHUTDOWN_MQ_DRAIN_TIMEOUT_SECONDS (30 s default)
+    # + SHUTDOWN_THREAD_JOIN_TIMEOUT_SECONDS × 2 (5 s × 2 = 10 s default)
+    # = 40 s.  Keep at least 5 s of headroom above that sum.
+    # Override STOP_GRACE_PERIOD_SECONDS in the environment or .env file to
+    # change both this period and the in-process budget check simultaneously.
+    stop_grace_period: "${STOP_GRACE_PERIOD_SECONDS:-45}s"
     restart: unless-stopped

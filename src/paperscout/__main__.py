@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import logging.handlers
+import signal
 import sys
 import threading
 from datetime import datetime, timezone
@@ -22,6 +23,7 @@ from .scout import (
     notify_users,
     register_handlers,
 )
+from .shutdown import shutdown_services
 from .sources import ISOProber, WG21Index
 from .storage import ProbeState, UserWatchlist
 
@@ -128,8 +130,37 @@ def _setup_logging(data_dir: Path, console_level: str = "INFO", retention_days: 
         logging.getLogger(lib).setLevel(logging.WARNING)
 
 
+def _register_shutdown_signals(
+    loop: asyncio.AbstractEventLoop,
+    shutdown_event: asyncio.Event,
+    shutdown_reason: list[str | None],
+) -> None:
+    """Register SIGTERM/SIGINT handlers that set *shutdown_event*."""
+
+    def _on_signal(signame: str) -> None:
+        """Record the first shutdown signal and wake the scheduler."""
+        if shutdown_reason[0] is None:
+            shutdown_reason[0] = signame
+        shutdown_event.set()
+
+    for sig, name in ((signal.SIGTERM, "SIGTERM"), (signal.SIGINT, "SIGINT")):
+        try:
+            loop.add_signal_handler(sig, lambda n=name: _on_signal(n))
+        except NotImplementedError:
+            signal.signal(sig, lambda *_a, n=name: _on_signal(n))
+
+
 async def _async_main() -> None:
     """Start DB, Slack app, health server, and the polling scheduler."""
+    shutdown_event = asyncio.Event()
+    shutdown_reason: list[str | None] = [None]
+    health_server = None
+    bolt_thread = None
+    mq = None
+    app = None
+
+    _register_shutdown_signals(asyncio.get_running_loop(), shutdown_event, shutdown_reason)
+
     data_dir = settings.data_dir
     data_dir.mkdir(parents=True, exist_ok=True)
 
@@ -156,6 +187,27 @@ async def _async_main() -> None:
         settings.gap_max_rev,
         settings.frontier_gap_threshold,
     )
+
+    _shutdown_budget = (
+        settings.shutdown_mq_drain_timeout_seconds
+        + 2 * settings.shutdown_thread_join_timeout_seconds
+    )
+    log.info(
+        "Shutdown budget: %.0fs (mq_drain=%.0f + 2×thread_join=%.0f)",
+        _shutdown_budget,
+        settings.shutdown_mq_drain_timeout_seconds,
+        settings.shutdown_thread_join_timeout_seconds,
+    )
+    if (
+        settings.stop_grace_period_seconds > 0
+        and _shutdown_budget >= settings.stop_grace_period_seconds
+    ):
+        log.warning(
+            "Shutdown budget %.0fs ≥ stop_grace_period %.0fs — increase "
+            "STOP_GRACE_PERIOD_SECONDS or reduce SHUTDOWN_*_TIMEOUT_SECONDS",
+            _shutdown_budget,
+            settings.stop_grace_period_seconds,
+        )
 
     if not settings.database_url:
         log.error("DATABASE_URL is not set — cannot start")
@@ -215,27 +267,42 @@ async def _async_main() -> None:
             _pool_status(pool),
         )
 
-    register_handlers(app, user_watchlist, state, paper_count_fn, launch_time)
+    try:
+        register_handlers(app, user_watchlist, state, paper_count_fn, launch_time)
 
-    start_health_server(
-        settings.health_port,
-        launch_time,
-        state,
-        paper_count_fn,
-        bind_host=settings.health_bind_host,
-        extra_fields_fn=_extra_health_fields,
-    )
-    log.info("Starting Slack Bolt app on port %d", settings.port)
-    bolt_thread = threading.Thread(
-        target=app.start,
-        kwargs={"port": settings.port},
-        daemon=True,
-    )
-    bolt_thread.start()
+        health_server = start_health_server(
+            settings.health_port,
+            launch_time,
+            state,
+            paper_count_fn,
+            bind_host=settings.health_bind_host,
+            extra_fields_fn=_extra_health_fields,
+        )
+        log.info("Starting Slack Bolt app on port %d", settings.port)
+        bolt_thread = threading.Thread(
+            target=app.start,
+            kwargs={"port": settings.port},
+            daemon=True,
+            name="bolt",
+        )
+        bolt_thread.start()
 
-    enqueue_startup_status(mq, state, paper_count_fn)
+        enqueue_startup_status(mq, state, paper_count_fn)
 
-    await scheduler.run_forever()
+        await scheduler.run_forever(shutdown_event)
+    finally:
+        shutdown_services(
+            reason=shutdown_reason[0] or "unknown",
+            mq=mq,
+            health_server=health_server,
+            health_thread=(
+                getattr(health_server, "_paperscout_thread", None) if health_server else None
+            ),
+            app=app,
+            bolt_thread=bolt_thread,
+            mq_drain_timeout=settings.shutdown_mq_drain_timeout_seconds,
+            thread_join_timeout=settings.shutdown_thread_join_timeout_seconds,
+        )
 
 
 def main() -> None:
@@ -244,7 +311,7 @@ def main() -> None:
         asyncio.run(_async_main())
     except KeyboardInterrupt:
         log.info("=== Paperscout shutting down (KeyboardInterrupt) ===")
-        sys.exit(0)
+    sys.exit(0)
 
 
 if __name__ == "__main__":

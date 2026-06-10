@@ -100,6 +100,7 @@ def start_health_server(
 
     server = HTTPServer((bind_host, port), handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True, name="health")
+    server._paperscout_thread = thread  # noqa: SLF001 — joined during graceful shutdown
     thread.start()
     log.info("Health endpoint listening on %s:%d", bind_host, port)
     return server
