@@ -12,7 +12,7 @@ import httpx
 import pytest
 
 from paperscout.errors import ConfigurationError
-from paperscout.models import CycleResult, CycleStatus, Paper, PerUserMatches, ProbeHit
+from paperscout.models import CycleResult, CycleStatus, MatchReason, Paper, PerUserMatches, ProbeHit
 from paperscout.monitor import (
     DiffResult,
     PollResult,
@@ -189,7 +189,7 @@ class TestPollResult:
     def test_explicit_per_user_matches(self):
         diff = DiffResult(new_papers=[], updated_papers=[])
         paper = Paper(id="P2300R11")
-        pum = PerUserMatches(papers=[(paper, "author")], probe_hits=[])
+        pum = PerUserMatches(papers=[(paper, MatchReason.AUTHOR)], probe_hits=[])
         result = PollResult(diff=diff, probe_hits=[], per_user_matches={"U1": pum})
         assert "U1" in result.per_user_matches
 
@@ -358,7 +358,7 @@ class TestScheduler:
         prober.run_cycle = AsyncMock(return_value=_empty_cycle())
 
         user_watchlist.matches_for_users.return_value = {
-            "U123": PerUserMatches(papers=[(new_paper, "author")], probe_hits=[])
+            "U123": PerUserMatches(papers=[(new_paper, MatchReason.AUTHOR)], probe_hits=[])
         }
         result = await scheduler.poll_once()
         assert "U123" in result.per_user_matches
@@ -373,7 +373,7 @@ class TestScheduler:
         index.papers = {}
 
         user_watchlist.matches_for_users.return_value = {
-            "U123": PerUserMatches(papers=[], probe_hits=[(hit, "author")])
+            "U123": PerUserMatches(papers=[], probe_hits=[(hit, MatchReason.AUTHOR)])
         }
         result = await scheduler.poll_once()
         assert "U123" in result.per_user_matches
@@ -403,7 +403,7 @@ class TestScheduler:
         hit = _recent_hit()
         prober.run_cycle = AsyncMock(return_value=_success_cycle([hit]))
         user_watchlist.matches_for_users.return_value = {
-            "U123": PerUserMatches(papers=[], probe_hits=[(hit, "author")])
+            "U123": PerUserMatches(papers=[], probe_hits=[(hit, MatchReason.AUTHOR)])
         }
         result = await scheduler.poll_once()
         assert len(notified) == 1
@@ -418,7 +418,7 @@ class TestScheduler:
         hit = _recent_hit()
         prober.run_cycle = AsyncMock(return_value=_success_cycle([hit]))
         user_watchlist.matches_for_users.return_value = {
-            "U123": PerUserMatches(papers=[], probe_hits=[(hit, "author")])
+            "U123": PerUserMatches(papers=[], probe_hits=[(hit, MatchReason.AUTHOR)])
         }
         result = await scheduler.poll_once()
         assert len(notified) == 1

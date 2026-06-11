@@ -10,7 +10,7 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, cast
 
-from .models import PerUserMatches
+from .models import MatchReason, PerUserMatches
 
 if TYPE_CHECKING:
     from psycopg2.pool import ThreadedConnectionPool
@@ -371,29 +371,29 @@ class UserWatchlist:
             authors = user_authors.get(uid, [])
             paper_nums = user_papers.get(uid, set())
 
-            matched_papers: list[tuple[Paper, str]] = []
+            matched_papers: list[tuple[Paper, MatchReason]] = []
             for paper in new_papers:
                 # Author match
                 if authors and paper.author:
                     author_lower = paper.author.lower()
                     if any(a in author_lower for a in authors):
-                        matched_papers.append((paper, "author"))
+                        matched_papers.append((paper, MatchReason.AUTHOR))
                         continue
                 # Paper-number match
                 if paper_nums and paper.number is not None and paper.number in paper_nums:
-                    matched_papers.append((paper, "paper"))
+                    matched_papers.append((paper, MatchReason.PAPER))
 
-            matched_hits: list[tuple[ProbeHit, str]] = []
+            matched_hits: list[tuple[ProbeHit, MatchReason]] = []
             for hit in probe_hits:
                 # Author match via front_text
                 if authors and hit.front_text:
                     text_lower = hit.front_text.lower()
                     if any(a in text_lower for a in authors):
-                        matched_hits.append((hit, "author"))
+                        matched_hits.append((hit, MatchReason.AUTHOR))
                         continue
                 # Paper-number match via probe hit number
                 if paper_nums and hit.number in paper_nums:
-                    matched_hits.append((hit, "paper"))
+                    matched_hits.append((hit, MatchReason.PAPER))
 
             if matched_papers or matched_hits:
                 result[uid] = PerUserMatches(

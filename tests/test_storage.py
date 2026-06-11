@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import pytest
 
-from paperscout.models import Paper
+from paperscout.models import MatchReason, Paper
 from paperscout.storage import (
     PaperCache,
     ProbeState,
@@ -309,6 +309,8 @@ class TestUserWatchlist:
         assert "U1" in result
         matched_papers = [p for p, _ in result["U1"].papers]
         assert paper in matched_papers
+        _, reason = result["U1"].papers[0]
+        assert reason is MatchReason.AUTHOR
 
     def test_matches_for_users_paper_match(self, fake_pool):
         wl = UserWatchlist(fake_pool)
@@ -406,7 +408,7 @@ class TestUserWatchlistRawSeed:
         result = wl.matches_for_users([paper], [])
         assert "U1" in result
         reasons = [r for _, r in result["U1"].papers]
-        assert "author" in reasons
+        assert MatchReason.AUTHOR in reasons
 
     def test_matches_paper_with_none_number_never_paper_matched(self, fake_pool):
         wl = UserWatchlist(fake_pool)

@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
-from paperscout.models import Paper, PerUserMatches, ProbeHit
+from paperscout.models import MatchReason, Paper, PerUserMatches, ProbeHit
 from paperscout.monitor import DiffResult, DPTransition, PollResult
 from paperscout.scout import (
     _batch_lines,
@@ -278,7 +278,7 @@ class TestNotifyUsers:
         paper = Paper(
             id="P2300R11", title="Senders", author="Eric Niebler", url="https://wg21.link/P2300R11"
         )
-        pum = PerUserMatches(papers=[(paper, "author")], probe_hits=[])
+        pum = PerUserMatches(papers=[(paper, MatchReason.AUTHOR)], probe_hits=[])
         result = _make_result(per_user_matches={"U123": pum})
         notify_users(app, result, mq)
         mq.enqueue.assert_called_once()
@@ -291,7 +291,7 @@ class TestNotifyUsers:
         app = MagicMock()
         mq = MagicMock()
         paper = Paper(id="P2300R11", title="X", author="Someone", url="https://wg21.link/P2300R11")
-        pum = PerUserMatches(papers=[(paper, "paper")], probe_hits=[])
+        pum = PerUserMatches(papers=[(paper, MatchReason.PAPER)], probe_hits=[])
         result = _make_result(per_user_matches={"U456": pum})
         notify_users(app, result, mq)
         channel, text = mq.enqueue.call_args[0]
@@ -302,7 +302,7 @@ class TestNotifyUsers:
         app = MagicMock()
         mq = MagicMock()
         hit = _recent_hit()
-        pum = PerUserMatches(papers=[], probe_hits=[(hit, "author")])
+        pum = PerUserMatches(papers=[], probe_hits=[(hit, MatchReason.AUTHOR)])
         result = _make_result(per_user_matches={"U789": pum})
         notify_users(app, result, mq)
         mq.enqueue.assert_called_once()
@@ -313,7 +313,7 @@ class TestNotifyUsers:
         app = MagicMock()
         mq = MagicMock()
         paper = Paper(id="P2300R11", title="X", author="Niebler")
-        pum = PerUserMatches(papers=[(paper, "author")], probe_hits=[])
+        pum = PerUserMatches(papers=[(paper, MatchReason.AUTHOR)], probe_hits=[])
         result = _make_result(per_user_matches={"U1": pum, "U2": pum})
         notify_users(app, result, mq)
         assert mq.enqueue.call_count == 2

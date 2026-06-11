@@ -159,6 +159,13 @@ class Tier(str, Enum):
     COLD = "cold"
 
 
+class MatchReason(str, Enum):
+    """Why a watchlist entry matched a paper or probe hit."""
+
+    AUTHOR = "author"
+    PAPER = "paper"
+
+
 @dataclass(slots=True)
 class ProbeHit:
     """Successful HEAD to an unpublished draft URL plus optional excerpt text."""
@@ -211,7 +218,7 @@ class CycleResult:
 
 @dataclass
 class PerUserMatches:
-    """One user's watchlist hits: ``(paper|hit, 'author'|'paper')`` tuples."""
+    """One user's watchlist hits: ``(paper|hit, MatchReason)`` tuples."""
 
-    papers: list[tuple[Paper, str]] = field(default_factory=list)
-    probe_hits: list[tuple[ProbeHit, str]] = field(default_factory=list)
+    papers: list[tuple[Paper, MatchReason]] = field(default_factory=list)
+    probe_hits: list[tuple[ProbeHit, MatchReason]] = field(default_factory=list)

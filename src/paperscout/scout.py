@@ -521,7 +521,7 @@ def notify_users(app: App, result: PollResult, mq: MessageQueue) -> None:
             lines.append("*:rotating_light: Papers matching your watchlist:*")
             for paper, reason in matches.papers:
                 p_link = _paper_link(paper)
-                tag = f"[{reason} match]"
+                tag = f"[{reason.value} match]"
                 lines.append(f"• {p_link} — {paper.title} (by *{paper.author}*) {tag}")
 
         if matches.probe_hits:
@@ -529,7 +529,7 @@ def notify_users(app: App, result: PollResult, mq: MessageQueue) -> None:
             for hit, reason in matches.probe_hits:
                 h_link = _hit_label(hit.url, hit.prefix, hit.number, hit.revision, hit.extension)
                 lm = _fmt_lm(hit.last_modified)
-                tag = f"[{reason} match]"
+                tag = f"[{reason.value} match]"
                 lines.append(f"• {h_link} — {lm} {tag}")
 
         if not lines:
