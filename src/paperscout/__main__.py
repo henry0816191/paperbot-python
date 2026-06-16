@@ -24,7 +24,7 @@ from .scout import (
     register_handlers,
 )
 from .shutdown import shutdown_services
-from .sources import ISOProber, WG21Index
+from .sources import ISOProber, OpenStdSource, WG21Index
 from .storage import ProbeState, UserWatchlist
 
 log = logging.getLogger("paperscout")
@@ -222,6 +222,9 @@ async def _async_main() -> None:
     user_watchlist = UserWatchlist(pool)
     index = WG21Index(pool, cfg=settings)
     prober = ISOProber(index, state, user_watchlist)
+    sources: list = [index, prober]
+    if settings.enable_open_std:
+        sources.append(OpenStdSource())
     app = create_app()
     mq = MessageQueue(app)
     mq.start()
@@ -252,10 +255,10 @@ async def _async_main() -> None:
         return status
 
     scheduler = Scheduler(
-        index=index,
-        prober=prober,
+        sources=sources,
         user_watchlist=user_watchlist,
         state=state,
+        cfg=settings,
         notify_callback=_on_poll_result,
         ops_alert_fn=_ops_alert,
     )

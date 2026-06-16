@@ -12,13 +12,21 @@ import httpx
 import pytest
 
 from paperscout.errors import ConfigurationError
-from paperscout.models import CycleResult, CycleStatus, MatchReason, Paper, PerUserMatches, ProbeHit
+from paperscout.models import (
+    CycleResult,
+    CycleStatus,
+    MatchReason,
+    Paper,
+    PerUserMatches,
+    ProbeHit,
+)
 from paperscout.monitor import (
     DiffResult,
     PollResult,
     Scheduler,
     diff_snapshots,
 )
+from paperscout.protocols import SOURCE_ISO_PROBE, SOURCE_WG21_INDEX
 from paperscout.sources import ISOProber, WG21Index
 from paperscout.storage import ProbeState, UserWatchlist
 from tests.conftest import make_test_settings
@@ -197,34 +205,67 @@ class TestPollResult:
 # ── Scheduler ─────────────────────────────────────────────────────────────────
 
 
+def _make_mock_wg21() -> MagicMock:
+    mock = MagicMock(spec=WG21Index)
+    mock.source_id = SOURCE_WG21_INDEX
+    mock.papers = {}
+
+    async def _fetch():
+        return dict(mock.papers)
+
+    mock.fetch = AsyncMock(side_effect=_fetch)
+    mock.diff = lambda previous, current: diff_snapshots(previous or {}, current)
+    return mock
+
+
+def _make_mock_iso() -> MagicMock:
+    mock = MagicMock(spec=ISOProber)
+    mock.source_id = SOURCE_ISO_PROBE
+
+    async def _fetch():
+        return mock._cycle_result
+
+    mock._cycle_result = _empty_cycle()
+    mock.fetch = AsyncMock(side_effect=_fetch)
+    mock.snapshot_stats = MagicMock(return_value={})
+    mock._stats = {}
+
+    def _diff(previous, current):
+        del previous
+        if current.status is CycleStatus.SUCCESS:
+            return list(current.hits)
+        return []
+
+    mock.diff = _diff
+    return mock
+
+
+def _set_iso_cycle(prober: MagicMock, cycle: CycleResult) -> None:
+    prober._cycle_result = cycle
+
+
 def _make_scheduler(fake_pool, **cfg_overrides):
-    index = MagicMock(spec=WG21Index)
-    index.refresh = AsyncMock()
-    index.papers = {}
-    prober = MagicMock(spec=ISOProber)
-    prober.run_cycle = AsyncMock(return_value=_empty_cycle())
-    prober.snapshot_stats = MagicMock(return_value={})
-    prober._stats = {}
+    wg21 = _make_mock_wg21()
+    iso = _make_mock_iso()
     user_watchlist = MagicMock(spec=UserWatchlist)
     user_watchlist.matches_for_users.return_value = {}
     state = ProbeState(fake_pool)
     cfg = make_test_settings(**cfg_overrides)
     scheduler = Scheduler(
-        index=index,
-        prober=prober,
+        sources=[wg21, iso],
         user_watchlist=user_watchlist,
         state=state,
         cfg=cfg,
     )
-    return scheduler, index, prober, user_watchlist, state
+    return scheduler, wg21, iso, user_watchlist, state
 
 
 class TestScheduler:
     async def test_poll_once_seeds_on_first_call(self, fake_pool):
         scheduler, index, prober, _, _ = _make_scheduler(fake_pool)
         await scheduler.poll_once()
-        index.refresh.assert_called_once()
-        prober.run_cycle.assert_called_once()
+        index.fetch.assert_called_once()
+        prober.fetch.assert_called_once()
         assert scheduler._seeded
 
     async def test_poll_once_returns_empty_on_seed(self, fake_pool):
@@ -238,7 +279,7 @@ class TestScheduler:
 
         new_paper = Paper(id="P9999R0", title="New", author="Author", date="2024-01-01")
         index.papers = {"P9999R0": new_paper}
-        prober.run_cycle = AsyncMock(return_value=_empty_cycle())
+        _set_iso_cycle(prober, _empty_cycle())
         result = await scheduler.poll_once()
         assert len(result.diff.new_papers) == 1
 
@@ -249,7 +290,7 @@ class TestScheduler:
         recent = _recent_hit()
         old = _old_hit()
         index.papers = {}
-        prober.run_cycle = AsyncMock(return_value=_success_cycle([recent, old]))
+        _set_iso_cycle(prober, _success_cycle([recent, old]))
         result = await scheduler.poll_once()
         assert len(result.probe_hits) == 1
         assert result.probe_hits[0].is_recent is True
@@ -262,10 +303,13 @@ class TestScheduler:
         state.mark_discovered(draft_url, last_modified_ts=1_700_000_000.0)
 
         new_paper = Paper(
-            id="P9999R0", title="New Published Paper", author="Author", date="2025-01-01"
+            id="P9999R0",
+            title="New Published Paper",
+            author="Author",
+            date="2025-01-01",
         )
         index.papers = {"P9999R0": new_paper}
-        prober.run_cycle = AsyncMock(return_value=_empty_cycle())
+        _set_iso_cycle(prober, _empty_cycle())
 
         result = await scheduler.poll_once()
         assert len(result.dp_transitions) == 1
@@ -280,7 +324,7 @@ class TestScheduler:
 
         n_paper = Paper(id="N4950", title="Working Draft", author="Ed", date="2025-01-01")
         index.papers = {"N4950": n_paper}
-        prober.run_cycle = AsyncMock(return_value=_empty_cycle())
+        _set_iso_cycle(prober, _empty_cycle())
 
         result = await scheduler.poll_once()
         assert result.dp_transitions == []
@@ -291,7 +335,7 @@ class TestScheduler:
 
         new_paper = Paper(id="P8888R0", title="Entirely New", author="X", date="2025-01-01")
         index.papers = {"P8888R0": new_paper}
-        prober.run_cycle = AsyncMock(return_value=_empty_cycle())
+        _set_iso_cycle(prober, _empty_cycle())
 
         result = await scheduler.poll_once()
         assert result.dp_transitions == []
@@ -306,7 +350,7 @@ class TestScheduler:
         state.mark_discovered(draft_url)
         new_paper = Paper(id="P7777R0", title="X", author="Y", date="2025-01-01")
         index.papers = {"P7777R0": new_paper}
-        prober.run_cycle = AsyncMock(return_value=_empty_cycle())
+        _set_iso_cycle(prober, _empty_cycle())
 
         with caplog.at_level(logging.INFO):
             result = await scheduler.poll_once()
@@ -328,10 +372,10 @@ class TestScheduler:
         await scheduler.poll_once()
 
         old_paper = Paper(id="P9999R0", title="Old Title", author="A", date="2024-01-01")
-        scheduler._previous_papers = {"P9999R0": old_paper}
+        scheduler._snapshots[SOURCE_WG21_INDEX] = {"P9999R0": old_paper}
         updated_paper = Paper(id="P9999R0", title="New Title", author="A", date="2024-01-01")
         index.papers = {"P9999R0": updated_paper}
-        prober.run_cycle = AsyncMock(return_value=_empty_cycle())
+        _set_iso_cycle(prober, _empty_cycle())
         with caplog.at_level(logging.DEBUG):
             await scheduler.poll_once()
         assert "INDEX-UPD" in caplog.text
@@ -343,7 +387,7 @@ class TestScheduler:
         await scheduler.poll_once()
         old = _old_hit()
         index.papers = {}
-        prober.run_cycle = AsyncMock(return_value=_success_cycle([old]))
+        _set_iso_cycle(prober, _success_cycle([old]))
         with caplog.at_level(logging.INFO):
             result = await scheduler.poll_once()
         assert result.probe_hits == []
@@ -355,7 +399,7 @@ class TestScheduler:
 
         new_paper = Paper(id="P9999R0", title="Senders", author="Eric Niebler", date="2024-01-01")
         index.papers = {"P9999R0": new_paper}
-        prober.run_cycle = AsyncMock(return_value=_empty_cycle())
+        _set_iso_cycle(prober, _empty_cycle())
 
         user_watchlist.matches_for_users.return_value = {
             "U123": PerUserMatches(papers=[(new_paper, MatchReason.AUTHOR)], probe_hits=[])
@@ -369,7 +413,7 @@ class TestScheduler:
         await scheduler.poll_once()
 
         hit = _recent_hit(front_text="written by eric niebler")
-        prober.run_cycle = AsyncMock(return_value=_success_cycle([hit]))
+        _set_iso_cycle(prober, _success_cycle([hit]))
         index.papers = {}
 
         user_watchlist.matches_for_users.return_value = {
@@ -401,7 +445,7 @@ class TestScheduler:
         scheduler.notify_callback = notified.append
         state.touch_poll()
         hit = _recent_hit()
-        prober.run_cycle = AsyncMock(return_value=_success_cycle([hit]))
+        _set_iso_cycle(prober, _success_cycle([hit]))
         user_watchlist.matches_for_users.return_value = {
             "U123": PerUserMatches(papers=[], probe_hits=[(hit, MatchReason.AUTHOR)])
         }
@@ -416,7 +460,7 @@ class TestScheduler:
         scheduler.notify_callback = notified.append
         state.mark_discovered("https://isocpp.org/files/papers/D1111R0.pdf")
         hit = _recent_hit()
-        prober.run_cycle = AsyncMock(return_value=_success_cycle([hit]))
+        _set_iso_cycle(prober, _success_cycle([hit]))
         user_watchlist.matches_for_users.return_value = {
             "U123": PerUserMatches(papers=[], probe_hits=[(hit, MatchReason.AUTHOR)])
         }
@@ -432,7 +476,7 @@ class TestScheduler:
         scheduler.notify_callback = notified.append
         state.touch_poll()
         old = _old_hit()
-        prober.run_cycle = AsyncMock(return_value=_success_cycle([old]))
+        _set_iso_cycle(prober, _success_cycle([old]))
         with caplog.at_level(logging.INFO):
             result = await scheduler.poll_once()
         assert result.probe_hits == []
@@ -441,26 +485,39 @@ class TestScheduler:
     async def test_poll_once_skips_refresh_when_disabled(self, fake_pool):
         scheduler, index, _, _, _ = _make_scheduler(fake_pool, enable_bulk_wg21=False)
         scheduler._seeded = True
-        scheduler._previous_papers = {}
+        scheduler._snapshots[SOURCE_WG21_INDEX] = {}
         await scheduler.poll_once()
-        index.refresh.assert_not_called()
+        index.fetch.assert_not_called()
 
     async def test_poll_once_skips_probe_when_disabled(self, fake_pool):
         scheduler, _, prober, _, _ = _make_scheduler(fake_pool, enable_iso_probe=False)
         scheduler._seeded = True
-        scheduler._previous_papers = {}
+        scheduler._snapshots[SOURCE_WG21_INDEX] = {}
         await scheduler.poll_once()
-        prober.run_cycle.assert_not_called()
+        prober.fetch.assert_not_called()
+
+    async def test_seed_does_not_log_index_new_on_baseline(self, fake_pool, caplog):
+        import logging
+
+        scheduler, wg21, _, _, _ = _make_scheduler(fake_pool)
+        paper = Paper(id="P9999R0", title="Baseline", author="Author", date="2024-01-01")
+        wg21.papers = {"P9999R0": paper}
+
+        with caplog.at_level(logging.INFO):
+            await scheduler.seed()
+
+        assert "INDEX-NEW" not in caplog.text
+        assert scheduler._snapshots[SOURCE_WG21_INDEX] == {"P9999R0": paper}
 
     async def test_seed_marks_discovered(self, fake_pool):
         scheduler, _, prober, _, state = _make_scheduler(fake_pool)
         hit = _recent_hit()
 
-        async def fake_run_cycle():
+        async def fake_fetch():
             state.mark_discovered(hit.url)
             return _success_cycle([hit])
 
-        prober.run_cycle = AsyncMock(side_effect=fake_run_cycle)
+        prober.fetch = AsyncMock(side_effect=fake_fetch)
         seed_result = await scheduler.seed()
         assert seed_result.probe_hits == [hit]
         assert state.is_discovered(hit.url)
@@ -604,7 +661,7 @@ class TestScheduler:
         await scheduler.poll_once()
         before = scheduler._last_successful_poll
         index.papers = {}
-        prober.run_cycle = AsyncMock(return_value=_failed_cycle("network down"))
+        _set_iso_cycle(prober, _failed_cycle("network down"))
         await scheduler.poll_once()
         assert scheduler._last_successful_poll == before
         assert scheduler._last_cycle_status == CycleStatus.FAILED
@@ -616,7 +673,7 @@ class TestScheduler:
         scheduler, _, prober, _, state = _make_scheduler(fake_pool)
         assert state.last_poll == 0
         assert len(state.get_all_discovered()) == 0
-        prober.run_cycle = AsyncMock(return_value=_failed_cycle("connect error"))
+        _set_iso_cycle(prober, _failed_cycle("connect error"))
         await scheduler.poll_once()
         assert scheduler._last_successful_poll is None
         assert scheduler._last_cycle_status == CycleStatus.FAILED

@@ -8,11 +8,11 @@ import copy
 import logging
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from types import MappingProxyType
-from typing import Any
+from typing import Any, cast
 
 import httpx
 
@@ -20,7 +20,8 @@ from .concurrency import run_blocking_io
 from .config import Settings, settings
 from .errors import ConfigurationError, FailureCategory
 from .models import CycleResult, CycleStatus, Paper, PerUserMatches, ProbeHit
-from .sources import ISOProber, WG21Index
+from .protocols import SOURCE_ISO_PROBE, SOURCE_OPEN_STD, SOURCE_WG21_INDEX, DataSource
+from .sources import ISOProber, OpenStdEntry, WG21Index
 from .storage import ProbeState, UserWatchlist
 
 log = logging.getLogger(__name__)
@@ -37,7 +38,7 @@ class DiffResult:
     updated_papers: list[Paper]
 
 
-def diff_snapshots(
+def _diff_paper_maps(
     previous: dict[str, Paper],
     current: dict[str, Paper],
 ) -> DiffResult:
@@ -65,6 +66,14 @@ def diff_snapshots(
     new_papers.sort(key=_paper_sort_key, reverse=True)
     updated_papers.sort(key=_paper_sort_key, reverse=True)
     return DiffResult(new_papers=new_papers, updated_papers=updated_papers)
+
+
+def diff_snapshots(
+    previous: dict[str, Paper],
+    current: dict[str, Paper],
+) -> DiffResult:
+    """Compare two id→paper maps; detect additions and metadata changes."""
+    return _diff_paper_maps(previous, current)
 
 
 # ── Poll Result ──────────────────────────────────────────────────────────────
@@ -150,22 +159,20 @@ class Scheduler:
 
     def __init__(
         self,
-        index: WG21Index,
-        prober: ISOProber,
+        sources: Sequence[DataSource],
         user_watchlist: UserWatchlist,
         state: ProbeState,
         cfg: Settings | None = None,
         notify_callback=None,
         ops_alert_fn: Callable[[str], None] | None = None,
     ):
-        self.index = index
-        self.prober = prober
+        self.sources = list(sources)
         self.user_watchlist = user_watchlist
         self.state = state
         self.cfg = cfg or settings
         self.notify_callback = notify_callback
         self.ops_alert_fn = ops_alert_fn
-        self._previous_papers: dict[str, Paper] = {}
+        self._snapshots: dict[str, Any] = {}
         self._seeded = False
         self._poll_count = 0
         self._last_successful_poll: float | None = None
@@ -175,6 +182,83 @@ class Scheduler:
         self._last_ops_alert: float | None = None
         self._health_lock = threading.Lock()
         self._health_snapshot: SchedulerSnapshot | None = None
+
+    def _source_by_id(self, source_id: str) -> DataSource | None:
+        for source in self.sources:
+            if source.source_id == source_id:
+                return source
+        return None
+
+    def _wg21_index(self) -> WG21Index | None:
+        source = self._source_by_id(SOURCE_WG21_INDEX)
+        return cast(WG21Index, source) if source is not None else None
+
+    def _iso_prober(self) -> ISOProber | None:
+        source = self._source_by_id(SOURCE_ISO_PROBE)
+        return cast(ISOProber, source) if source is not None else None
+
+    def _source_enabled(self, source_id: str) -> bool:
+        if source_id == SOURCE_WG21_INDEX:
+            return self.cfg.enable_bulk_wg21
+        if source_id == SOURCE_ISO_PROBE:
+            return self.cfg.enable_iso_probe
+        if source_id == SOURCE_OPEN_STD:
+            return self.cfg.enable_open_std
+        return True
+
+    def _log_index_diff(self, diff: DiffResult) -> None:
+        for paper in diff.new_papers:
+            log.info(
+                "INDEX-NEW  id=%-14s  author=%-20s  date=%s  title=%r",
+                paper.id,
+                paper.author or "?",
+                paper.date or "?",
+                (paper.title or "")[:80],
+            )
+        for paper in diff.updated_papers:
+            log.debug(
+                "INDEX-UPD  id=%-14s  author=%-20s  date=%s",
+                paper.id,
+                paper.author or "?",
+                paper.date or "?",
+            )
+
+    async def _poll_sources(self, *, baseline: bool = False) -> tuple[DiffResult, list[ProbeHit]]:
+        diff = DiffResult(new_papers=[], updated_papers=[])
+        probe_hits: list[ProbeHit] = []
+
+        for source in self.sources:
+            if not self._source_enabled(source.source_id):
+                continue
+
+            current = await source.fetch()
+            if baseline:
+                self._snapshots[source.source_id] = current
+                if source.source_id == SOURCE_ISO_PROBE:
+                    cycle = cast(CycleResult, current)
+                    probe_hits = self._probe_hits_from_cycle(cycle)
+                    self._record_probe_cycle_completion()
+                continue
+
+            previous = self._snapshots.get(source.source_id)
+            result = source.diff(previous, current)
+            self._snapshots[source.source_id] = current
+
+            if source.source_id == SOURCE_WG21_INDEX:
+                diff = result
+                papers = cast(dict[str, Paper], current)
+                log.info("INDEX-LOAD  papers=%d", len(papers))
+                self._log_index_diff(diff)
+            elif source.source_id == SOURCE_ISO_PROBE:
+                cycle = cast(CycleResult, current)
+                probe_hits = self._probe_hits_from_cycle(cycle)
+                self._record_probe_cycle_completion()
+            elif source.source_id == SOURCE_OPEN_STD:
+                new_entries = cast(list[OpenStdEntry], result)
+                if new_entries:
+                    log.info("OPEN-STD  new=%d", len(new_entries))
+
+        return diff, probe_hits
 
     def _probe_hits_from_cycle(self, cycle: CycleResult) -> list[ProbeHit]:
         """Extract hits and record last cycle status for health / staleness."""
@@ -193,7 +277,9 @@ class Scheduler:
 
     def _record_probe_cycle_completion(self) -> None:
         """Update probe stats after any completed cycle (including FAILED)."""
-        self._last_probe_stats = self.prober.snapshot_stats()
+        prober = self._iso_prober()
+        if prober is not None:
+            self._last_probe_stats = prober.snapshot_stats()
 
     def _mark_poll_successful_if_probe_ok(self) -> None:
         """Advance staleness clock only when the last probe cycle did not fail."""
@@ -245,24 +331,25 @@ class Scheduler:
         t0 = time.monotonic()
         log.info("SEED-START  seeding local database from all sources")
 
-        if self.cfg.enable_bulk_wg21:
-            await self.index.refresh()
-            log.info("SEED  wg21.link loaded  papers=%d", len(self.index.papers))
+        diff, hits = await self._poll_sources(baseline=True)
+        del diff
 
-        self._previous_papers = dict(self.index.papers)
-
-        hits: list[ProbeHit] = []
+        wg21 = self._wg21_index()
+        paper_count = (
+            len(wg21.papers)
+            if wg21 is not None
+            else len(self._snapshots.get(SOURCE_WG21_INDEX, {}))
+        )
+        if self.cfg.enable_bulk_wg21 and wg21 is not None:
+            log.info("SEED  wg21.link loaded  papers=%d", len(wg21.papers))
         if self.cfg.enable_iso_probe:
-            cycle = await self.prober.run_cycle()
-            hits = self._probe_hits_from_cycle(cycle)
-            self._record_probe_cycle_completion()
             log.info("SEED  isocpp.org probe  existing=%d", len(hits))
 
         self._seeded = True
         log.info(
             "SEED-DONE  elapsed=%.1fs  papers=%d  discovered=%d  had_prior_state=%s",
             time.monotonic() - t0,
-            len(self._previous_papers),
+            paper_count,
             len(self.state.get_all_discovered()),
             had_prior_state,
         )
@@ -330,37 +417,7 @@ class Scheduler:
             self._publish_health_snapshot()
             return result
 
-        previous = dict(self._previous_papers)
-
-        if self.cfg.enable_bulk_wg21:
-            await self.index.refresh()
-            log.info("INDEX-LOAD  papers=%d", len(self.index.papers))
-
-        diff = diff_snapshots(previous, self.index.papers)
-        self._previous_papers = dict(self.index.papers)
-
-        for paper in diff.new_papers:
-            log.info(
-                "INDEX-NEW  id=%-14s  author=%-20s  date=%s  title=%r",
-                paper.id,
-                paper.author or "?",
-                paper.date or "?",
-                (paper.title or "")[:80],
-            )
-        for paper in diff.updated_papers:
-            log.debug(
-                "INDEX-UPD  id=%-14s  author=%-20s  date=%s",
-                paper.id,
-                paper.author or "?",
-                paper.date or "?",
-            )
-
-        probe_hits: list[ProbeHit] = []
-        if self.cfg.enable_iso_probe:
-            cycle = await self.prober.run_cycle()
-            probe_hits = self._probe_hits_from_cycle(cycle)
-            self._record_probe_cycle_completion()
-
+        diff, probe_hits = await self._poll_sources()
         recent_hits = [h for h in probe_hits if h.is_recent]
         old_hits = [h for h in probe_hits if not h.is_recent]
 

@@ -35,6 +35,7 @@ class Settings(BaseSettings):
     poll_overrun_cooldown_seconds: int = Field(default=300, ge=1)  # 5 min
     enable_bulk_wg21: bool = True
     enable_iso_probe: bool = True
+    enable_open_std: bool = False
 
     # -- Paper prefixes / extensions (globals used for gap/unknown numbers) --
     probe_prefixes: list[str] = Field(default_factory=lambda: ["D", "P"])

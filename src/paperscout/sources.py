@@ -19,6 +19,7 @@ import httpx
 from .config import Settings, settings
 from .errors import FailureCategory
 from .models import CycleResult, CycleStatus, Paper, ProbeHit, Tier
+from .protocols import SOURCE_ISO_PROBE, SOURCE_OPEN_STD, SOURCE_WG21_INDEX
 from .storage import PaperCache, ProbeState, UserWatchlist
 
 log = logging.getLogger(__name__)
@@ -41,6 +42,8 @@ class WG21Index:
     other sync worker — ``refresh()`` mutates internal state and would
     race with cross-thread reads on ``papers`` / ``_max_rev``.
     """
+
+    source_id: str = SOURCE_WG21_INDEX
 
     def __init__(self, pool, cfg: Settings | None = None):
         self._cfg = cfg or settings
@@ -185,6 +188,20 @@ class WG21Index:
         """Read-only mapping copy of ``papers`` (not the live dict object)."""
         return MappingProxyType(dict(self.papers))
 
+    async def fetch(self) -> dict[str, Paper]:
+        """DataSource: load index and return the current paper map."""
+        return await self.refresh()
+
+    def diff(
+        self,
+        previous: dict[str, Paper] | None,
+        current: dict[str, Paper],
+    ):
+        """DataSource: compare two index snapshots."""
+        from .monitor import _diff_paper_maps
+
+        return _diff_paper_maps(previous or {}, current)
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # ISO Paper Prober
@@ -265,6 +282,8 @@ class ISOProber:
     threads, ``asyncio.to_thread()``, or thread-pool executors.
     """
 
+    source_id: str = SOURCE_ISO_PROBE
+
     # Keys that _stats is reset to at the start of every run_cycle().
     _STATS_TEMPLATE: dict[str, int] = {
         "skipped_discovered": 0,  # URL already in probe_state
@@ -306,6 +325,24 @@ class ISOProber:
         """Return a copy of per-cycle probe counters (lock-protected)."""
         with self._stats_lock:
             return dict(self._stats)
+
+    async def fetch(self) -> CycleResult:
+        """DataSource: run one probe cycle."""
+        return await self.run_cycle()
+
+    def diff(
+        self,
+        previous: CycleResult | None,
+        current: CycleResult,
+    ) -> list[ProbeHit]:
+        """DataSource: extract hits from the current probe cycle.
+
+        Probe diff is not snapshot comparison like WG21; ``previous`` is ignored.
+        """
+        del previous
+        if current.status is not CycleStatus.SUCCESS:
+            return []
+        return list(current.hits)
 
     # ── Public API ───────────────────────────────────────────────────────────
 
@@ -728,3 +765,25 @@ def _parse_open_std_html(html: str) -> list[OpenStdEntry]:
             )
         )
     return entries
+
+
+class OpenStdSource:
+    """DataSource wrapper for the open-std.org yearly paper table scraper."""
+
+    source_id: str = SOURCE_OPEN_STD
+
+    def __init__(self, year: int | None = None):
+        self._year = year
+
+    async def fetch(self) -> list[OpenStdEntry]:
+        return await scrape_open_std(self._year)
+
+    def diff(
+        self,
+        previous: list[OpenStdEntry] | None,
+        current: list[OpenStdEntry],
+    ) -> list[OpenStdEntry]:
+        if not previous:
+            return list(current)
+        prev_ids = {e.paper_id for e in previous}
+        return [e for e in current if e.paper_id not in prev_ids]
